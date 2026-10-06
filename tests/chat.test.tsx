@@ -7,6 +7,10 @@ const ME = 1
 const ANNA = 2
 const FILIP = 3
 const MARCELA = 4
+const JOHN = 5
+const JOHNNY = 6
+const EMILY = 7
+const MICHAEL = 8
 
 const conversations = [
   {
@@ -23,8 +27,12 @@ const conversations = [
 
 const everyone = [
   { id: ANNA, firstName: 'Anna', lastName: 'Nová', handle: 'anna' },
-  { id: FILIP, firstName: 'Filip', lastName: 'Čižmár', handle: 'filip' },
+  { id: FILIP, firstName: 'Filip', lastName: 'Jančík', handle: 'filip' },
   { id: MARCELA, firstName: 'Marcela', lastName: 'Filipová', handle: 'marcela' },
+  { id: JOHN, firstName: 'John', lastName: 'Smith', handle: 'john' },
+  { id: JOHNNY, firstName: 'Johnny', lastName: 'Walker', handle: 'johnnyw' },
+  { id: EMILY, firstName: 'Emily', lastName: 'Clarke', handle: 'emily' },
+  { id: MICHAEL, firstName: 'Michael', lastName: "O'Brien", handle: 'mobrien' },
 ]
 
 const reply = (data: unknown) => ({ value: { content: [{ type: 'text', text: JSON.stringify(data) }], isError: false } })
@@ -138,11 +146,19 @@ test('/tw-dm matches name and surname, and never sends the surname as the messag
 
   const run = async (args: string) => ((await $.command.run({ command: 'tw-dm', args })) as { text: string }).text
 
-  expect(await run('Filip Čižmár Test')).toBe('Sent to Filip Čižmár.')
-  expect(await run('filip cizmar bez diakritiky')).toBe('Sent to Filip Čižmár.')
-  expect(await run('Filip ahoj')).toBe('Sent to Filip Čižmár.') // "Filipová" is a surname, not a first-name match
+  expect(await run('Filip Jančík Test')).toBe('Sent to Filip Jančík.')
+  expect(await run('filip jancik bez diakritiky')).toBe('Sent to Filip Jančík.')
+  expect(await run('Filip ahoj')).toBe('Sent to Filip Jančík.') // "Filipová" is a surname, not a first-name match
   expect(await run('@marcela ahoj')).toBe('Sent to Marcela Filipová.')
-  expect(await run('Filip Čižmár')).toMatch(/^Usage/)
+  expect(await run('Filip Jančík')).toMatch(/^Usage/)
+
+  // English names
+  expect(await run('John Smith hello there')).toBe('Sent to John Smith.')
+  expect(await run('John hi')).toBe('Sent to John Smith.') // "Johnny" is another first name
+  expect(await run('johnny walker Cheers!')).toBe('Sent to Johnny Walker.')
+  expect(await run('@emily see you tomorrow')).toBe('Sent to Emily Clarke.')
+  expect(await run("Michael O'Brien thanks a lot")).toBe("Sent to Michael O'Brien.")
+  expect(await run('Emily Clarke')).toMatch(/^Usage/)
   expect(await run('Nikdo tady')).toMatch(/Nobody/)
 
   expect(sent.map(s => s.args)).toEqual([
@@ -150,6 +166,11 @@ test('/tw-dm matches name and surname, and never sends the surname as the messag
     { user_id: FILIP, body: 'bez diakritiky' },
     { user_id: FILIP, body: 'ahoj' },
     { user_id: MARCELA, body: 'ahoj' },
+    { user_id: JOHN, body: 'hello there' },
+    { user_id: JOHN, body: 'hi' },
+    { user_id: JOHNNY, body: 'Cheers!' },
+    { user_id: EMILY, body: 'see you tomorrow' },
+    { user_id: MICHAEL, body: 'thanks a lot' },
   ])
 })
 
