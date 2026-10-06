@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { columnsOf, pictureSize, rasterFrom, splitLinks } from '../hooks/register.tsx'
+import { cellsFromChafa, columnsOf, errorLine, pictureModeFrom, pictureSize, platformFrom, rasterFrom, splitLinks } from '../hooks/register.tsx'
 
 const ME = 1
 const ANNA = 2
@@ -37,7 +37,7 @@ const everyone = [
 
 const reply = (data: unknown) => ({ value: { content: [{ type: 'text', text: JSON.stringify(data) }], isError: false } })
 
-function engine(on: On, opened: unknown[] = []) {
+function engine(on: On, opened: unknown[] = [], connector = { isUp: true }) {
   const sent: { tool: string; args: unknown }[] = []
   mock.store(on)
   const clock = mock.clock(on)
@@ -51,6 +51,9 @@ function engine(on: On, opened: unknown[] = []) {
   on('ui.render', () => h('Text', {}, 'engine'))
   on('ui.toast', () => ({ value: undefined }))
   on('mcp.call', ($, e) => {
+    // a test hook cannot make the call reject, so the engine's not-connected message comes back as a tool error
+    const offline = `no connected MCP tool "${e.tool}" on a server named "claude_ai_Teamwork_com"`
+    if (!connector.isUp) return { value: { content: [{ type: 'text', text: offline }], isError: true } }
     switch (e.tool) {
       case 'twchat-get_current_user':
         // the real shape: { account: { id, url, user: { id } } }
@@ -219,7 +222,7 @@ async function openConversation($: any) {
 test('Paste image previews the clipboard image, and Cancel discards the file', async ($, on) => {
   engine(on)
   const ran = clipboard(on)
-  mock.env(on, {})
+  mock.env(on, { WSL_DISTRO_NAME: 'Ubuntu' })
   const pane = await openConversation($)
 
   await pane.press({ key: 'paste' })
@@ -239,7 +242,7 @@ test('Send uploads the image, then posts the message with its tempId', async ($,
   engine(on)
   const ran = clipboard(on)
   // the key comes from teamwork.env in the Claude config folder
-  mock.env(on, { CLAUDE_CONFIG_DIR: '/home/me/.claude-work' })
+  mock.env(on, { CLAUDE_CONFIG_DIR: '/home/me/.claude-work', WSL_DISTRO_NAME: 'Ubuntu' })
   on('fs.read', ($, e) =>
     e.path === '/home/me/.claude-work/teamwork.env'
       ? { value: '# Teamwork\nTEAMWORK_API_KEY="key123"\n' }
@@ -275,7 +278,7 @@ test('an image message is drawn as a picture, with a download link on the Teamwo
   on('mcp.call', { tool: 'twchat-list_messages' }, () =>
     reply({ messages: [{ id: 101, body: '', createdAt: '2026-10-06T08:00:00.000Z', author: { id: ANNA, fullName: 'Anna Nová' }, file }] }))
   engine(on)
-  mock.env(on, { TEAMWORK_API_KEY: 'key123' })
+  mock.env(on, { TEAMWORK_API_KEY: 'key123', WSL_DISTRO_NAME: 'Ubuntu' })
   const ran: { argv: string[]; stdin?: string }[] = []
   on('process.run', ($, e) => {
     ran.push({ argv: [...e.argv], stdin: e.init?.stdin })
@@ -303,7 +306,7 @@ test('an image message is drawn as a picture, with a download link on the Teamwo
 })
 
 test('pictureSize keeps the aspect ratio in half-block rows', async () => {
-  expect(pictureSize({ width: 663, height: 902 })).toEqual({ columns: 48, rows: 16 }) // tall: capped
+  expect(pictureSize({ width: 663, height: 902 })).toEqual({ columns: 24, rows: 16 }) // tall: narrower, keeping its shape
   expect(pictureSize({ width: 200, height: 100 })).toEqual({ columns: 48, rows: 12 })
   expect(pictureSize({ width: 10, height: 10 })).toEqual({ columns: 10, rows: 5 })
   // one cell: red on top, blue below, as an upper-half block
@@ -395,4 +398,135 @@ test('a TEAMWORK_CHAT_DOCK session docks the chat wide and keeps the Claude colu
 
 test('an ordinary fullscreen session does not open the chat by itself', async ($, on) => {
   expect(await startDocking($, on, {})).toEqual([])
+})
+
+test('errorLine turns a not-yet-connected Teamwork into a countdown and leaves other errors alone', async () => {
+  const offline = 'Teamwork: no connected MCP tool "twchat-list_conversations" on a server named "claude_ai_Teamwork_com"'
+  expect(errorLine(offline, 4)).toBe('Teamwork: connecting… retrying in 4s')
+  expect(errorLine(offline, 0)).toBe('Teamwork: connecting…')
+  expect(errorLine('Teamwork: 500', 4)).toBe('Teamwork: 500')
+  expect(errorLine(null, null)).toBeNull()
+})
+
+test('while the connector is still connecting the band counts down, then shows the chats once it is up', async ($, on) => {
+  const connector = { isUp: false }
+  const { clock } = engine(on, [], connector)
+  mock.env(on, {})
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(1)
+
+  const band = await $.ui.mount(BAND)
+  expect(await band.find({ type: 'Text', text: /connecting… retrying in 5s/ })).toBeDefined()
+  await clock.advance(2000)
+  expect(await band.find({ type: 'Text', text: /retrying in 3s/ })).toBeDefined()
+
+  connector.isUp = true
+  await clock.advance(3000)
+  expect(await band.find({ type: 'Text', text: /connecting/ })).toBeUndefined()
+  expect(await band.find({ key: 'bb-10' })).toBeDefined()
+})
+
+test('platformFrom tells WSL, native Windows and the rest apart', async () => {
+  expect(platformFrom({ WSL_DISTRO_NAME: 'Ubuntu', OS: 'Windows_NT' })).toBe('wsl')
+  expect(platformFrom({ OS: 'Windows_NT' })).toBe('windows')
+  expect(platformFrom({})).toBe('unix')
+})
+
+test('pictureModeFrom draws real pixels only where the terminal speaks kitty graphics, unless set', async () => {
+  expect(pictureModeFrom('auto', { TERM: 'xterm-kitty' })).toBe('image')
+  expect(pictureModeFrom(undefined, { TERM_PROGRAM: 'ghostty' })).toBe('image')
+  expect(pictureModeFrom('auto', { WT_SESSION: 'x', TERM: 'xterm-256color' })).toBe('mosaic')
+  expect(pictureModeFrom('image', {})).toBe('image')
+  expect(pictureModeFrom('off', { TERM: 'xterm-kitty' })).toBe('off')
+})
+
+const shot = {
+  id: 777, name: 'shot.jpg', contentType: 'image/jpeg', bytes: 94557, width: 800, height: 400,
+  url: 'https://haproxy-tls-1.us-east-1.elb.amazonaws.com/chat/attachments/777',
+  thumbnails: {},
+}
+
+function picturesOn(on: On, env: Record<string, string>) {
+  on('mcp.call', { tool: 'twchat-list_messages' }, () =>
+    reply({ messages: [{ id: 101, body: '', createdAt: '2026-10-06T08:00:00.000Z', author: { id: ANNA, fullName: 'Anna Nová' }, file: shot }] }))
+  engine(on)
+  mock.env(on, { TEAMWORK_API_KEY: 'key123', ...env })
+  const ran: string[][] = []
+  on('process.run', ($, e) => {
+    ran.push([...e.argv])
+    if (e.argv[0] === 'wslpath') return done(`C:\\wsl\\${e.argv[2]!.split('/').at(-1)}\n`)
+    return done()
+  })
+  return ran
+}
+
+test('in kitty on WSL a picture is a PNG the terminal draws, made by PowerShell at the box size', async ($, on) => {
+  const ran = picturesOn(on, { WSL_DISTRO_NAME: 'Ubuntu', TERM: 'xterm-kitty' })
+  const pane = await openConversation($)
+
+  const made = ran.find(argv => argv[0] === 'powershell.exe')!
+  // 800 x 400 fits 60 columns by 15 rows, 10 x 20 pixels a cell
+  expect(made.at(-1)).toMatch(/'C:\\wsl\\tw-thumb-777' 'C:\\wsl\\tw-chat-777\.png' '600' '300'$/)
+  const picture = await pane.find({ key: 'pic-777' })
+  expect(picture?.type).toBe('Image')
+  expect(picture?.props).toMatchObject({ source: { file: '/tmp/tw-chat-777.png', format: 'png' }, columns: 60, rows: 15 })
+  expect(ran).toContainEqual(['rm', '-f', '/tmp/tw-thumb-777'])
+})
+
+test('on native Windows the picture goes through curl.exe and %TEMP%, with no wslpath', async ($, on) => {
+  // the mosaic: a Windows path in an Image would not count as absolute on the Linux engine running this test
+  const ran = picturesOn(on, { OS: 'Windows_NT', TEMP: 'C:\\Users\\me\\AppData\\Local\\Temp' })
+  const temp = 'C:\\Users\\me\\AppData\\Local\\Temp'
+  const pane = await openConversation($)
+
+  expect(ran.find(argv => argv[0] === 'curl.exe')).toContain(`${temp}\\tw-thumb-777`)
+  expect(ran.some(argv => argv[0] === 'wslpath')).toBe(false)
+  expect(ran.find(argv => argv[0] === 'powershell.exe')?.at(-1)).toContain(`'${temp}\\tw-thumb-777'`)
+  expect(ran).toContainEqual(['cmd.exe', '/d', '/c', 'del', '/q', `${temp}\\tw-thumb-777`])
+  expect(await pane.find({ key: 'open-777' })).toBeDefined()
+})
+
+test('with pictures off nothing is downloaded and the file badge stands alone', { options: { pictures: 'off' } }, async ($, on) => {
+  const ran = picturesOn(on, { WSL_DISTRO_NAME: 'Ubuntu' })
+  const pane = await openConversation($)
+  expect(ran).toEqual([])
+  expect(await pane.find({ key: 'pic-777' })).toBeUndefined()
+  expect(await pane.find({ key: 'open-777' })).toBeDefined()
+})
+
+const ESC = String.fromCharCode(27)
+// two rows of two cells as chafa prints them: a reset, then fg and bg before every cell
+const chafaText = `${ESC}[0m${ESC}[38;2;255;0;0;48;2;0;0;255m▀${ESC}[0m${ESC}[38;2;0;255;0;48;2;255;255;255m▖${ESC}[0m\n`
+  + `${ESC}[38;2;1;2;3;48;2;4;5;6m▌${ESC}[0m ${ESC}[0m\n`
+
+const wordsOf = (cells: string) => new Uint32Array(Uint8Array.from(atob(cells), c => c.charCodeAt(0)).buffer)
+
+test('cellsFromChafa turns chafa text into Raster cells: glyph, foreground, background', async () => {
+  const r = cellsFromChafa(chafaText)!
+  expect([r.columns, r.rows]).toEqual([2, 2])
+  expect([...wordsOf(r.cells)]).toEqual([
+    0x2580, 0xff0000, 0x0000ff, 0x2596, 0x00ff00, 0xffffff,
+    0x258c, 0x010203, 0x040506, 0x20, 0x000000, 0xffffff, // after a reset: the default colours
+  ])
+  expect(cellsFromChafa('')).toBeNull()
+})
+
+test('with chafa installed the mosaic comes from chafa and PowerShell is not asked', async ($, on) => {
+  on('mcp.call', { tool: 'twchat-list_messages' }, () =>
+    reply({ messages: [{ id: 101, body: '', createdAt: '2026-10-06T08:00:00.000Z', author: { id: ANNA, fullName: 'Anna Nová' }, file: shot }] }))
+  engine(on)
+  mock.env(on, { TEAMWORK_API_KEY: 'key123', WSL_DISTRO_NAME: 'Ubuntu' })
+  const ran: string[][] = []
+  on('process.run', ($, e) => {
+    ran.push([...e.argv])
+    return done(e.argv[0] === 'chafa' ? chafaText : '')
+  })
+  const pane = await openConversation($)
+
+  const chafa = ran.find(argv => argv[0] === 'chafa')!
+  expect(chafa.slice(-3)).toEqual(['-s', '48x12', '/tmp/tw-thumb-777']) // 800 x 400: 48 columns, half as many pixel rows, two per cell
+  expect(ran.some(argv => argv[0] === 'powershell.exe')).toBe(false)
+  const picture = await pane.find({ key: 'pic-777' })
+  expect(picture?.type).toBe('Raster')
+  expect(picture?.props).toMatchObject({ columns: 2, rows: 2 })
 })

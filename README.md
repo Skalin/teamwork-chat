@@ -12,7 +12,7 @@ A Claude Code mod that brings **Teamwork Chat** into your Claude Code session, s
 ## Requirements
 
 - Claude Code with the **claude.ai Teamwork.com connector** connected (it is what reads and sends chat messages)
-- For sending and previewing images: WSL on Windows (PowerShell reads the clipboard and shrinks pictures), `curl`, and a Teamwork API key (below)
+- For sending and previewing images: WSL or native Windows (PowerShell reads the clipboard and shrinks pictures), `curl`, and a Teamwork API key (below). On Linux and macOS previews work in kitty or Ghostty (with ImageMagick's `magick` for non-PNG images); pasting needs Windows
 - The fullscreen layout (`"tui": "fullscreen"` in your Claude Code settings) docks the pane as a sidebar; without it the pane opens above the prompt
 
 ## Install
@@ -35,6 +35,12 @@ echo 'TEAMWORK_API_KEY=<your key>' > ~/.claude/teamwork.env
 ```
 
 `TEAMWORK_API_KEY` in the environment works too and wins over the file. Everything else works without a key.
+
+### Pictures
+
+In **kitty** or **Ghostty** images are drawn with real pixels (the kitty graphics protocol); every other terminal, Windows Terminal included, gets a coloured-block mosaic. With [chafa](https://hpjansson.org/chafa/) installed (`sudo apt install chafa`) the mosaic picks the best block shape for each cell and is noticeably sharper; without it, PowerShell's half blocks are the fallback. On WSL, kitty runs through WSLg: `sudo apt install kitty`, then start `claude` inside it.
+
+The `pictures` option (in `/config`, or `pluginConfigs` in settings) overrides the choice: `auto` (default), `image` (e.g. WezTerm with `enable_kitty_graphics = true`), `mosaic` or `off`.
 
 ### Permissions in auto mode
 
@@ -77,7 +83,7 @@ claude-status() {
 
 - Reading a conversation here does not mark it read in Teamwork (the connector has no call for it)
 - Messages and attachments cannot be deleted or edited from here
-- The terminal draws images as low-resolution cell grids; the link opens the full file
+- Outside kitty and Ghostty images are low-resolution cell grids; the link opens the full file
 - The image upload uses Teamwork's undocumented chat endpoints, which may change
 
 ## Development
