@@ -122,7 +122,7 @@ test('band counts unread, opening the conversation reads it, replies are sent', 
     expect(hoverOf(tree, line)).toEqual({ inverse: true, dimColor: false })
   }
   for (const row of ['tab-unread-top', 'tab-unread', 'tab-unread-bottom']) {
-    expect(hoverOf(tree, row)).toEqual({ color: '#ff8c00', inverse: true, dimColor: false })
+    expect(hoverOf(tree, row)).toEqual({ scope: `chip-${row.replace(/-(top|bottom)$/, '')}`, color: '#ff8c00', inverse: true, dimColor: false })
   }
   expect(await pane.find({ key: 'pb-10' })).toBeDefined()
   expect(await pane.find({ key: 'pb-20' })).toBeUndefined()
@@ -621,4 +621,36 @@ test('while an image is sent a moving bar shows the step and the seconds in plac
   expect(await pane.find({ key: 'image-sending' })).toBeUndefined()
   expect(await pane.find({ key: 'pasted' })).toBeUndefined()
   expect(await pane.find({ key: 'paste' })).toBeDefined()
+})
+
+test('in a narrow pane the badges keep their width and the tab row wraps instead', async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'tw', args: '' })
+  const pane = await $.ui.mount({
+    plugin: 'teamwork-chat', surface: 'terminal', component: 'Pane', requestId: 'teamwork-chat',
+    props: { title: 'Teamwork Chat', isFocused: true, bodyColumns: 40, placement: 'dock' } as any,
+  })
+  for (const key of ['chip-tab-all', 'chip-tab-unread', 'chip-tab-people', 'chip-refresh']) {
+    expect((await pane.find({ key }))?.props).toMatchObject({ flexShrink: 0 })
+  }
+  expect((await pane.findAll({ type: 'Box' })).filter(b => (b.props as any).flexWrap === 'wrap').length).toBeGreaterThanOrEqual(2)
+})
+
+test('the paste badge lights all three rows together, though its middle row carries an engine action', async ($, on) => {
+  engine(on)
+  const pane = await openConversation($)
+  const hoverOf = (node: any, key: string): unknown => {
+    if (node?.props?.key === key) return node.hover
+    for (const child of node?.children ?? []) {
+      const found = hoverOf(child, key)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  const tree = await pane.drawn()
+  for (const key of ['paste-top', 'paste', 'paste-bottom']) {
+    expect(hoverOf(tree, key)).toEqual({ scope: 'chip-paste', color: '#ff8c00', inverse: true, dimColor: false })
+  }
+  expect((await pane.find({ key: 'paste' }))?.props).toMatchObject({ action: 'chat:imagePaste' })
 })
