@@ -1,8 +1,24 @@
 {
   "name": "teamwork-chat",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Teamwork Chat inside Claude Code: unread badges, a conversations pane, replies, direct messages, images and suggested replies",
-  "author": { "name": "Dominik Skála" },
+  "author": {
+    "name": "Dominik Skála"
+  },
   "repository": "https://github.com/Skalin/teamwork-chat",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "pictures": {
+      "type": "string",
+      "title": "Pictures",
+      "description": "How images in messages are drawn: auto (real pixels in kitty or Ghostty, a coloured-block mosaic elsewhere), image, mosaic or off",
+      "default": "auto",
+      "options": [
+        "auto",
+        "image",
+        "mosaic",
+        "off"
+      ]
+    }
+  }
 }

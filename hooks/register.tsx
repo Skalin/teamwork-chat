@@ -3,9 +3,16 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { TwConversation, TwFile, TwMessage, TwPastedImage, TwPerson, TwPicture, TwView } from '../types'
 
+export type Platform = 'wsl' | 'windows' | 'unix'
+export type PictureMode = 'image' | 'mosaic' | 'off'
+type Env = Record<string, string | undefined>
+
 const SERVER = 'claude_ai_Teamwork_com'
 const PANE = 'teamwork-chat'
-const POLL_MS = 60_000
+const POLL_MS = 30_000
+const RETRY_MS = 5_000 // while the Teamwork connector is still connecting
+const CONV_POLL_MS = 5_000 // an open conversation fetches its newest messages this often
+const CONV_IDLE_MS = 5 * 60_000 // and goes back to the list after this long without activity
 const PAGES = 3 // list_conversations returns at most 10 per page
 
 const convs = atom({ plugin: 'teamwork-chat', key: 'convs' } as const, [])
@@ -24,6 +31,7 @@ const replyGeneration = atom({ plugin: 'teamwork-chat', key: 'replyGeneration' }
 const hasReplyText = atom({ plugin: 'teamwork-chat', key: 'hasReplyText' } as const, false)
 const pasted = atom({ plugin: 'teamwork-chat', key: 'pasted' } as const, null)
 const isFocus = atom({ plugin: 'teamwork-chat', key: 'isFocus' } as const, true)
+const retryIn = atom({ plugin: 'teamwork-chat', key: 'retryIn' } as const, null)
 
 // Transcript rows hidden in focus mode; the spinner, command output and dialogs stay.
 const HIDDEN_ROWS = ['UserMessage', 'AssistantMessage', 'ToolUse', 'ToolResult', 'ToolGroup', 'TurnDuration'] as const
@@ -196,8 +204,44 @@ async function setStatus($: $): Promise<void> {
   $.ui.status(n > 0 ? `💬 Teamwork: ${n} unread` : undefined)
 }
 
+// The connector comes up a few seconds after the session starts; until then every call fails with this.
+export function isNotConnected(err: string | null): boolean {
+  return err !== null && err.includes('no connected MCP tool')
+}
+
+export function errorLine(err: string | null, seconds: number | null): string | null {
+  if (!isNotConnected(err)) return err
+  return seconds ? `Teamwork: connecting… retrying in ${seconds}s` : 'Teamwork: connecting…'
+}
+
+async function loadMe($: $): Promise<void> {
+  const user = await tw($, 'get_current_user')
+  await update($, me, () => user.account?.user?.id ?? user.account?.id ?? user.user?.id ?? null)
+  await update($, siteUrl, () => siteOf(user))
+  await loadPeople($)
+}
+
+// Refreshes, then schedules the next refresh: soon, with a countdown, while the connector is not up yet.
+async function poll($: $, options?: { isQuiet?: boolean }): Promise<void> {
+  await refresh($, options)
+  const isWaiting = isNotConnected(await read($, error))
+  const delay = isWaiting ? RETRY_MS : POLL_MS
+  if (isWaiting) {
+    let left = Math.ceil(delay / 1000)
+    await update($, retryIn, () => left)
+    const tick = $.clock.every(1000, () => {
+      left -= 1
+      if (left <= 0) tick.cancel()
+      void update($, retryIn, () => Math.max(left, 0))
+    })
+  }
+  $.clock.after(delay, () => void poll($))
+}
+
 async function refresh($: $, { isQuiet = false } = {}): Promise<void> {
   try {
+    // tried again on every refresh until it works: at startup the connector may not be up yet
+    if ((await read($, me)) === null) await loadMe($)
     const myId = await read($, me)
     const before = new Map((await read($, convs)).map(c => [c.id, c.latestId]))
     const fresh: TwConversation[] = []
@@ -224,6 +268,7 @@ async function refresh($: $, { isQuiet = false } = {}): Promise<void> {
     )
     await update($, convs, () => fresh)
     await update($, error, () => null)
+    await update($, retryIn, () => null)
 
     const arrived = fresh.filter(
       c => before.size > 0 && c.latestId > (before.get(c.id) ?? 0) && isUnread(c, seenMap, myId),
@@ -236,7 +281,7 @@ async function refresh($: $, { isQuiet = false } = {}): Promise<void> {
     await setStatus($)
 
     const v = await read($, view)
-    if (v.mode === 'conv' && arrived.some(c => c.id === v.convId)) await loadMessages($, v.convId)
+    if (v.mode === 'conv' && arrived.some(c => c.id === v.convId) && (await loadMessages($, v.convId))) await touch($)
   } catch (err) {
     await update($, error, () => `Teamwork: ${(err as Error).message}`).catch(() => {})
   }
@@ -259,7 +304,9 @@ function toFile(raw: Json): TwFile | null {
   }
 }
 
-async function loadMessages($: $, convId: number): Promise<void> {
+// Fetches the conversation's newest messages; true when one arrived since the last fetch.
+// Quiet (the open conversation's poll) writes nothing when nothing changed.
+async function loadMessages($: $, convId: number, { isQuiet = false } = {}): Promise<boolean> {
   const r = await tw($, 'list_messages', { conversation_id: convId, page_size: 30 })
   const list: TwMessage[] = (r.messages ?? [])
     .map((m: Json) => ({
@@ -271,15 +318,71 @@ async function loadMessages($: $, convId: number): Promise<void> {
       file: toFile(m.file),
     }))
     .reverse()
+  // the person may have left (or opened another conversation) while this was fetched
+  const v = await read($, view)
+  if (v.mode !== 'conv' || v.convId !== convId) return false
+  const before = await read($, messages)
+  const isSame = before.length === list.length && before.every((m, i) => m.id === list[i]!.id && m.body === list[i]!.body)
+  if (isQuiet && isSame) return false
+  const hasNew = before.length > 0 && (list.at(-1)?.id ?? 0) > (before.at(-1)?.id ?? 0)
   await update($, messages, () => list)
   void loadPictures($, list).catch(() => {})
   const newest = list.at(-1)?.id ?? 0
   const next = await update($, seen, s => ({ ...s, [String(convId)]: Math.max(s[String(convId)] ?? 0, newest) }))
   await $.store.set('seen', next)
   await setStatus($)
+  return hasNew
+}
+
+let convTimer: { cancel: () => void } | null = null
+let lastActivity = 0
+
+// Something happened in the open conversation (the person did something, a message came), so it stays open.
+async function touch($: $): Promise<void> {
+  lastActivity = await $.clock.now()
+}
+
+async function leaveConv($: $): Promise<void> {
+  convTimer?.cancel()
+  convTimer = null
+  await discardPasted($)
+  await update($, suggestion, () => null)
+  await update($, hasReplyText, () => false)
+  await update($, view, (): TwView => ({ mode: 'all' }))
+}
+
+// While a conversation is open: its newest messages every 5 s, and back to the list after 5 idle minutes.
+function watchConv($: $, convId: number): void {
+  convTimer?.cancel()
+  let isFetching = false
+  const timer = $.clock.every(CONV_POLL_MS, () => void (async () => {
+    const v = await read($, view)
+    if (v.mode !== 'conv' || v.convId !== convId) {
+      timer.cancel()
+      if (convTimer === timer) convTimer = null
+      return
+    }
+    if ((await $.clock.now()) - lastActivity >= CONV_IDLE_MS) {
+      await leaveConv($)
+      $.ui.toast('Teamwork Chat: back to the list after 5 minutes without activity')
+      return
+    }
+    // one fetch at a time, and none while an action of the person's is running
+    if (isFetching || (await read($, isBusy))) return
+    isFetching = true
+    try {
+      if (await loadMessages($, convId, { isQuiet: true })) await touch($)
+    } catch {
+      // the list's own poll shows a connection error; this one just tries again
+    } finally {
+      isFetching = false
+    }
+  })())
+  convTimer = timer
 }
 
 async function busy($: $, work: () => Promise<void>): Promise<void> {
+  await touch($)
   await update($, isBusy, () => true)
   try {
     await work()
@@ -294,7 +397,11 @@ async function busy($: $, work: () => Promise<void>): Promise<void> {
 async function openConv($: $, convId: number, title: string): Promise<void> {
   await update($, view, (): TwView => ({ mode: 'conv', convId, title }))
   await update($, messages, () => [])
-  await busy($, () => loadMessages($, convId))
+  await touch($)
+  watchConv($, convId)
+  await busy($, async () => {
+    await loadMessages($, convId)
+  })
 }
 
 async function openDm($: $, person: TwPerson): Promise<void> {
@@ -329,6 +436,7 @@ const CLIPBOARD_SCRIPT = [
 ].join('; ')
 
 async function grabClipboardImage($: $): Promise<TwPastedImage> {
+  if ((await platformOf($)) === 'unix') throw new Error('Pasting an image reads the Windows clipboard: it works in WSL and on Windows.')
   const ran = await $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', CLIPBOARD_SCRIPT], { timeoutMs: 20_000 })
   if (ran.exitCode === 3) throw new Error('There is no image on the clipboard (copy one first, e.g. Win+Shift+S).')
   if (ran.exitCode !== 0) throw new Error(`Could not read the clipboard: ${oneLine(ran.stderr || ran.stdout, 160)}`)
@@ -336,15 +444,13 @@ async function grabClipboardImage($: $): Promise<TwPastedImage> {
   if (!winPath || !(Number(width) > 0) || !(Number(bytes) > 0)) {
     throw new Error(`Could not save the clipboard image: ${oneLine(ran.stderr || ran.stdout, 160)}`)
   }
-  const unix = await $.process.run(['wslpath', '-u', winPath])
-  if (unix.exitCode !== 0) throw new Error(`Could not locate the saved image: ${oneLine(unix.stderr, 160)}`)
-  return { path: unix.stdout.trim(), width: Number(width), height: Number(height), bytes: Number(bytes) }
+  return { path: await localPath($, winPath), width: Number(width), height: Number(height), bytes: Number(bytes) }
 }
 
 async function discardPasted($: $): Promise<void> {
   const image = await read($, pasted)
   await update($, pasted, () => null)
-  if (image) await $.process.run(['rm', '-f', image.path]).catch(() => undefined)
+  if (image) await removeFile($, image.path)
 }
 
 // The site address, as get_current_user answers it: { account: { url } }.
@@ -372,28 +478,124 @@ async function onSite($: $, url: string): Promise<string> {
   }
 }
 
+// WSL and native Windows reach PowerShell and the Windows clipboard; Linux and macOS do not.
+export function platformFrom(env: Env): Platform {
+  if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) return 'wsl'
+  if (env.OS === 'Windows_NT') return 'windows'
+  return 'unix'
+}
+
+// Real pixels need the kitty graphics protocol (kitty, Ghostty); every other terminal gets the mosaic.
+export function pictureModeFrom(setting: string | undefined, env: Env): PictureMode {
+  if (setting === 'image' || setting === 'mosaic' || setting === 'off') return setting
+  const isKittyGraphics = env.TERM === 'xterm-kitty' || !!env.KITTY_WINDOW_ID
+    || env.TERM_PROGRAM === 'ghostty' || !!env.GHOSTTY_RESOURCES_DIR
+  return isKittyGraphics ? 'image' : 'mosaic'
+}
+
+let envCache: Env | null = null
+async function envOf($: $): Promise<Env> {
+  // each name spelled out: the engine lists the variables a module reads
+  envCache ??= {
+    WSL_DISTRO_NAME: await $.env.get('WSL_DISTRO_NAME'),
+    WSL_INTEROP: await $.env.get('WSL_INTEROP'),
+    OS: await $.env.get('OS'),
+    TERM: await $.env.get('TERM'),
+    KITTY_WINDOW_ID: await $.env.get('KITTY_WINDOW_ID'),
+    TERM_PROGRAM: await $.env.get('TERM_PROGRAM'),
+    GHOSTTY_RESOURCES_DIR: await $.env.get('GHOSTTY_RESOURCES_DIR'),
+    TEMP: (await $.env.get('TEMP')) || undefined,
+    TMPDIR: (await $.env.get('TMPDIR')) || undefined,
+    HOME: (await $.env.get('HOME')) || undefined,
+    USERPROFILE: (await $.env.get('USERPROFILE')) || undefined,
+  }
+  return envCache
+}
+
+async function platformOf($: $): Promise<Platform> {
+  return platformFrom(await envOf($))
+}
+
+// A file in the temp folder, spelled the way this platform's programs (curl, PowerShell, the terminal) take it.
+async function tempFile($: $, name: string): Promise<string> {
+  const env = await envOf($)
+  if ((await platformOf($)) === 'windows') return `${(env.TEMP ?? `${env.USERPROFILE}\\AppData\\Local\\Temp`).replace(/\\$/, '')}\\${name}`
+  return `${(env.TMPDIR ?? '/tmp').replace(/\/$/, '')}/${name}`
+}
+
+async function removeFile($: $, path: string): Promise<void> {
+  const argv = (await platformOf($)) === 'windows' ? ['cmd.exe', '/d', '/c', 'del', '/q', path] : ['rm', '-f', path]
+  await $.process.run(argv).catch(() => undefined)
+}
+
+// PowerShell takes Windows paths: WSL translates its own, native Windows already has them.
+async function windowsPath($: $, path: string): Promise<string> {
+  if ((await platformOf($)) !== 'wsl') return path
+  const r = await $.process.run(['wslpath', '-w', path])
+  if (r.exitCode !== 0) throw new Error(`Could not translate ${path}: ${oneLine(r.stderr, 160)}`)
+  return r.stdout.trim()
+}
+
+async function localPath($: $, winPath: string): Promise<string> {
+  if ((await platformOf($)) !== 'wsl') return winPath
+  const r = await $.process.run(['wslpath', '-u', winPath])
+  if (r.exitCode !== 0) throw new Error(`Could not locate ${winPath}: ${oneLine(r.stderr, 160)}`)
+  return r.stdout.trim()
+}
+
+async function curl($: $): Promise<string> {
+  return (await platformOf($)) === 'windows' ? 'curl.exe' : 'curl'
+}
+
+function powershell(script: string, ...args: string[]): string[] {
+  const quoted = args.map(a => `'${a.replace(/'/g, "''")}'`).join(' ')
+  return ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', `& { ${script} } ${quoted}`]
+}
+
 const PICTURE_COLUMNS = 48
 const PICTURE_MAX_ROWS = 16
+const PHOTO_COLUMNS = 60
+const PHOTO_MAX_ROWS = 24
+const CELL_PIXELS = { width: 10, height: 20 } // roughly a terminal cell; the terminal scales to the box anyway
 
-// Shrinks an image to w x h pixels on white and prints them as one hex string, RRGGBB each.
-const PIXELS_SCRIPT = [
-  'param($path, $w, $h)',
+// Shrinks an image to w x h pixels on white, into $bmp.
+const SHRINK_SCRIPT = [
   'Add-Type -AssemblyName System.Drawing',
   '$src = [System.Drawing.Image]::FromFile($path)',
   '$bmp = New-Object System.Drawing.Bitmap ([int]$w), ([int]$h)',
   '$g = [System.Drawing.Graphics]::FromImage($bmp); $g.Clear([System.Drawing.Color]::White)',
   '$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic',
-  '$g.DrawImage($src, 0, 0, [int]$w, [int]$h); $g.Dispose(); $src.Dispose()',
+  // TileFlipXY keeps the resampler from blending the white edge into the picture's first row and column
+  '$attr = New-Object System.Drawing.Imaging.ImageAttributes; $attr.SetWrapMode([System.Drawing.Drawing2D.WrapMode]::TileFlipXY)',
+  '$g.DrawImage($src, (New-Object System.Drawing.Rectangle 0, 0, ([int]$w), ([int]$h)), 0, 0, $src.Width, $src.Height, [System.Drawing.GraphicsUnit]::Pixel, $attr)',
+  '$g.Dispose(); $src.Dispose()',
+]
+
+// The shrunk image as one hex string, RRGGBB each: the mosaic's pixels.
+const PIXELS_SCRIPT = [
+  'param($path, $w, $h)',
+  ...SHRINK_SCRIPT,
   '$sb = New-Object System.Text.StringBuilder',
   'for ($y = 0; $y -lt $bmp.Height; $y++) { for ($x = 0; $x -lt $bmp.Width; $x++) { $c = $bmp.GetPixel($x, $y); [void]$sb.Append($c.R.ToString("x2") + $c.G.ToString("x2") + $c.B.ToString("x2")) } }',
   '$sb.ToString()',
 ].join('\n')
 
-export function pictureSize(file: Pick<TwFile, 'width' | 'height'>): { columns: number; rows: number } {
-  const columns = Math.max(4, Math.min(PICTURE_COLUMNS, file.width || PICTURE_COLUMNS))
+// The shrunk image saved as a PNG (any input, JPEG and GIF too): what the terminal draws as real pixels.
+const PNG_SCRIPT = [
+  'param($path, $out, $w, $h)',
+  ...SHRINK_SCRIPT,
+  '$bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()',
+].join('\n')
+
+export function pictureSize(
+  file: Pick<TwFile, 'width' | 'height'>,
+  limit = { columns: PICTURE_COLUMNS, rows: PICTURE_MAX_ROWS },
+): { columns: number; rows: number } {
   const ratio = file.width > 0 && file.height > 0 ? file.height / file.width : 0.5
-  // a cell is about twice as tall as wide and holds two pixels stacked, so one row per two pixel rows
-  const rows = Math.max(1, Math.min(PICTURE_MAX_ROWS, Math.round((columns * ratio) / 2)))
+  let columns = Math.max(4, Math.min(limit.columns, file.width || limit.columns))
+  // a cell is about twice as tall as wide (and the mosaic stacks two pixels in one), so one row per two pixel rows
+  if ((columns * ratio) / 2 > limit.rows) columns = Math.max(4, Math.round((limit.rows * 2) / ratio))
+  const rows = Math.max(1, Math.min(limit.rows, Math.round((columns * ratio) / 2)))
   return { columns, rows }
 }
 
@@ -415,35 +617,116 @@ export function rasterFrom(hex: string, columns: number, rows: number): string {
   return btoa(binary)
 }
 
-async function drawPicture($: $, file: TwFile, key: string): Promise<TwPicture> {
+// chafa picks, cell by cell, the block shape (halves, quarters, eighths) that best follows the picture.
+const CHAFA_ARGS = ['-f', 'symbols', '-c', 'full', '--symbols', 'block+space', '-O', '0', '--relative', 'off',
+  '--polite', 'on', '--animate', 'off', '--bg', 'ffffff', '-w', '9']
+const DEFAULT_FG = 0x000000
+const DEFAULT_BG = 0xffffff
+
+// chafa's truecolor text, one SGR before each cell, into the Raster's cells.
+export function cellsFromChafa(text: string): { columns: number; rows: number; cells: string } | null {
+  const grid: number[][] = []
+  let row: number[] = []
+  let fg = DEFAULT_FG
+  let bg = DEFAULT_BG
+  const pattern = /\x1b\[([0-9;?]*)([A-Za-z])|([^\x1b])/gsu
+  for (const m of text.matchAll(pattern)) {
+    if (m[2] === 'm') {
+      const p = (m[1] || '0').split(';').map(Number)
+      for (let i = 0; i < p.length; i++) {
+        if (p[i] === 0) [fg, bg] = [DEFAULT_FG, DEFAULT_BG]
+        else if ((p[i] === 38 || p[i] === 48) && p[i + 1] === 2) {
+          const color = ((p[i + 2]! & 255) << 16) | ((p[i + 3]! & 255) << 8) | (p[i + 4]! & 255)
+          if (p[i] === 38) fg = color
+          else bg = color
+          i += 4
+        }
+      }
+    } else if (m[3] === '\n') {
+      grid.push(row)
+      row = []
+    } else if (m[3] !== undefined && m[3] !== '\r') {
+      const code = m[3].codePointAt(0)!
+      // a Raster cell holds one width-1 BMP character; anything else draws as its background
+      const isCell = code >= 0x20 && code <= 0xffff
+      row.push(isCell ? code : 0x20, fg, bg)
+    }
+  }
+  if (row.length > 0) grid.push(row)
+  const columns = Math.max(0, ...grid.map(r => r.length / 3))
+  if (columns === 0) return null
+  const words = new Uint32Array(columns * grid.length * 3)
+  grid.forEach((r, y) => {
+    for (let x = 0; x < columns; x++) {
+      const i = (y * columns + x) * 3
+      words.set(x * 3 < r.length ? r.slice(x * 3, x * 3 + 3) : [0x20, DEFAULT_FG, DEFAULT_BG], i)
+    }
+  })
+  const bytes = new Uint8Array(words.buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!)
+  return { columns, rows: grid.length, cells: btoa(binary) }
+}
+
+async function download($: $, file: TwFile, key: string, local: string): Promise<boolean> {
   const source = await onSite($, file.thumbnail ?? file.url)
-  const local = `/tmp/tw-thumb-${file.id}`
+  const program = await curl($)
   // the key goes to curl on stdin, never in its arguments
   for (const authorization of authHeaders(key)) {
     const got = await $.process.run(
-      ['curl', '-sS', '--fail', '-L', '--max-time', '30', '-K', '-', '-o', local, source],
+      [program, '-sS', '--fail', '-L', '--max-time', '30', '-K', '-', '-o', local, source],
       { stdin: `header = "Authorization: ${authorization}"\n`, timeoutMs: 40_000 },
     )
     if (got.exitCode === 0) {
       workingAuth = authorization
-      break
+      return true
     }
-    if (authorization === authHeaders(key).at(-1)) return 'failed'
   }
-  const win = await $.process.run(['wslpath', '-w', local])
-  const { columns, rows } = pictureSize(file)
-  const pixels = await $.process.run(
-    ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-      `& { ${PIXELS_SCRIPT} } '${win.stdout.trim().replace(/'/g, "''")}' ${columns} ${rows * 2}`],
-    { timeoutMs: 30_000 },
-  )
-  await $.process.run(['rm', '-f', local]).catch(() => undefined)
-  const hex = pixels.stdout.trim()
-  if (pixels.exitCode !== 0 || hex.length < columns * rows * 2 * 6) return 'failed'
-  return { columns, rows, cells: rasterFrom(hex, columns, rows) }
+  return false
+}
+
+async function drawPicture($: $, file: TwFile, key: string, mode: PictureMode): Promise<TwPicture> {
+  const platform = await platformOf($)
+  if (mode === 'off') return 'failed'
+  const local = await tempFile($, `tw-thumb-${file.id}`)
+  if (!(await download($, file, key, local))) return 'failed'
+  try {
+    if (mode === 'image') {
+      const { columns, rows } = pictureSize(file, { columns: PHOTO_COLUMNS, rows: PHOTO_MAX_ROWS })
+      const out = await tempFile($, `tw-chat-${file.id}.png`)
+      const size = [String(columns * CELL_PIXELS.width), String(rows * CELL_PIXELS.height)]
+      const made = platform === 'unix'
+        ? await $.process.run(['magick', local, '-background', 'white', '-flatten', '-resize', `${size[0]}x${size[1]}`, out])
+          .catch(() => undefined)
+        : await $.process.run(powershell(PNG_SCRIPT, await windowsPath($, local), await windowsPath($, out), ...size), { timeoutMs: 30_000 })
+      if (made?.exitCode === 0) return { columns, rows, file: out }
+      // without ImageMagick a PNG still draws as it is; anything else does not
+      if (platform !== 'unix' || file.contentType !== 'image/png') return 'failed'
+      const moved = await $.process.run(['mv', '-f', local, out])
+      return moved.exitCode === 0 ? { columns, rows, file: out } : 'failed'
+    }
+    const { columns, rows } = pictureSize(file)
+    const chafa = await $.process.run(['chafa', ...CHAFA_ARGS, '-s', `${columns}x${rows}`, local], { timeoutMs: 30_000 })
+      .catch(() => undefined)
+    const sharp = chafa?.exitCode === 0 ? cellsFromChafa(chafa.stdout) : null
+    if (sharp) return sharp
+    // without chafa: half blocks from PowerShell's pixels, which Linux and macOS lack
+    if (platform === 'unix') return 'failed'
+    const pixels = await $.process.run(
+      powershell(PIXELS_SCRIPT, await windowsPath($, local), String(columns), String(rows * 2)),
+      { timeoutMs: 30_000 },
+    )
+    const hex = pixels.stdout.trim()
+    if (pixels.exitCode !== 0 || hex.length < columns * rows * 2 * 6) return 'failed'
+    return { columns, rows, cells: rasterFrom(hex, columns, rows) }
+  } finally {
+    await removeFile($, local)
+  }
 }
 
 async function loadPictures($: $, list: TwMessage[]): Promise<void> {
+  const mode = pictureModeFrom(pictureSetting, await envOf($))
+  if (mode === 'off') return
   const key = await apiKey($)
   if (!key) return
   const have = await read($, pictures)
@@ -452,7 +735,7 @@ async function loadPictures($: $, list: TwMessage[]): Promise<void> {
     .filter((f): f is TwFile => f !== null && f.contentType.startsWith('image/') && !(String(f.id) in have))
   for (const file of wanted) {
     await update($, pictures, all => ({ ...all, [String(file.id)]: 'loading' as TwPicture }))
-    const picture = await drawPicture($, file, key).catch((): TwPicture => 'failed')
+    const picture = await drawPicture($, file, key, mode).catch((): TwPicture => 'failed')
     await update($, pictures, all => ({ ...all, [String(file.id)]: picture }))
   }
 }
@@ -461,7 +744,8 @@ const UPLOAD_URL = 'https://chat-uploads.teamwork.com/uploads'
 
 // The key lives in teamwork.env inside the Claude config folder (~/.claude-work for claude-work).
 async function keyFile($: $): Promise<string> {
-  const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+  const env = await envOf($)
+  const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${env.HOME ?? env.USERPROFILE ?? ''}/.claude`
   return `${dir.replace(/\/$/, '')}/teamwork.env`
 }
 
@@ -486,7 +770,7 @@ async function sendImage($: $, convId: number, image: TwPastedImage, caption = '
   }
 
   const up = await $.process.run(
-    ['curl', '-sS', '--fail-with-body', '--max-time', '60', '-F', `file=@${image.path};type=image/png`, UPLOAD_URL],
+    [await curl($), '-sS', '--fail-with-body', '--max-time', '60', '-F', `file=@${image.path};type=image/png`, UPLOAD_URL],
     { timeoutMs: 70_000 },
   )
   if (up.exitCode !== 0) throw new Error(`Image upload failed: ${oneLine(up.stdout || up.stderr, 160)}`)
@@ -523,14 +807,19 @@ async function sendImage($: $, convId: number, image: TwPastedImage, caption = '
   throw new Error('Teamwork did not accept TEAMWORK_API_KEY (401/403). Check the key.')
 }
 
-// Opens a web address in the Windows default browser (WSL), else the Linux one.
+// Opens a web address in the Windows default browser (WSL, Windows), else the Linux or macOS one.
 async function openInBrowser($: $, url: string): Promise<void> {
   if (!/^https:\/\//.test(url)) throw new Error('Only https links are opened.')
-  // explorer.exe hands the URL to the default browser; it reports exit code 1 even when it worked
-  const viaWindows = await $.process.run(['explorer.exe', url]).catch(() => undefined)
-  if (viaWindows) return
-  const viaLinux = await $.process.run(['xdg-open', url]).catch(() => undefined)
-  if (!viaLinux || viaLinux.exitCode !== 0) throw new Error(`Could not open a browser. The link: ${url}`)
+  if ((await platformOf($)) !== 'unix') {
+    // explorer.exe hands the URL to the default browser; it reports exit code 1 even when it worked
+    const viaWindows = await $.process.run(['explorer.exe', url]).catch(() => undefined)
+    if (viaWindows) return
+  }
+  for (const opener of ['xdg-open', 'open']) {
+    const ran = await $.process.run([opener, url]).catch(() => undefined)
+    if (ran?.exitCode === 0) return
+  }
+  throw new Error(`Could not open a browser. The link: ${url}`)
 }
 
 function sizeLabel(bytes: number): string {
@@ -575,7 +864,10 @@ async function showPane($: $, mode: TwView): Promise<void> {
   await $.ui.open({ id: PANE, title: 'Teamwork Chat', focus: true })
 }
 
-export const register: Register = on => {
+let pictureSetting: string | undefined
+
+export const register: Register = (on, options) => {
+  pictureSetting = typeof options?.pictures === 'string' ? options.pictures : undefined
   let isDocked = false
   // A session started with TEAMWORK_CHAT_DOCK=1 (the claude-status launcher) docks the chat as its main view.
   let isLauncher = false
@@ -598,16 +890,7 @@ export const register: Register = on => {
       // the launcher keeps the Claude column visible (it shows the routines); elsewhere the stored choice
       if (isLauncher) await update($, isFocus, () => false)
       else if (typeof focus === 'boolean') await update($, isFocus, () => focus)
-      try {
-        const user = await tw($, 'get_current_user')
-        await update($, me, () => user.account?.user?.id ?? user.account?.id ?? user.user?.id ?? null)
-        await update($, siteUrl, () => siteOf(user))
-        await loadPeople($)
-      } catch (err) {
-        await update($, error, () => `Teamwork: ${(err as Error).message}`)
-      }
-      await refresh($, { isQuiet: true })
-      $.clock.every(POLL_MS, () => void refresh($))
+      await poll($, { isQuiet: true })
     })().catch(() => {})
 
     return next(e)
@@ -682,7 +965,7 @@ export const register: Register = on => {
     const list = await read($, convs)
     const seenMap = await read($, seen)
     const myId = await read($, me)
-    const err = await read($, error)
+    const err = errorLine(await read($, error), await read($, retryIn))
     const focus = await read($, isFocus)
     const unread = list.filter(c => isUnread(c, seenMap, myId))
 
@@ -768,12 +1051,13 @@ export const register: Register = on => {
     const { Box, Button, Input, Link, Text } = table
     // only the terminal draws cell grids; elsewhere the file link stands alone
     const Raster = 'Raster' in table ? table.Raster : undefined
+    const Image = 'Image' in table ? table.Image : undefined
     const width = e.props.bodyColumns
     const v = await read($, view)
     const list = await read($, convs)
     const seenMap = await read($, seen)
     const myId = await read($, me)
-    const err = await read($, error)
+    const err = errorLine(await read($, error), await read($, retryIn))
     const loading = await read($, isBusy)
     const unreadCount = list.filter(c => isUnread(c, seenMap, myId)).length
 
@@ -857,12 +1141,7 @@ export const register: Register = on => {
     } else if (v.mode === 'conv') {
       const msgs = await read($, messages)
       // Show the newest messages that fit, so the header and the reply row stay on screen.
-      const back = () => void (async () => {
-        await discardPasted($)
-        await update($, suggestion, () => null)
-        await update($, hasReplyText, () => false)
-        await update($, view, (): TwView => ({ mode: 'all' }))
-      })()
+      const back = () => void leaveConv($)
       const image = await read($, pasted)
       const drafting = await read($, isSuggesting)
       const suggested = await read($, suggestion)
@@ -874,6 +1153,7 @@ export const register: Register = on => {
       const isTyped = await read($, hasReplyText)
       const showClear = isTyped || (draftText ?? '') !== ''
       const clearReply = () => void (async () => {
+        await touch($)
         await update($, suggestion, () => null)
         await update($, hasReplyText, () => false)
         const next = await update($, replyGeneration, n => n + 1)
@@ -939,7 +1219,13 @@ export const register: Register = on => {
                 const href = linkOf(f)
                 return (
                   <Box flexDirection="column">
-                    {Raster && typeof picture === 'object' && <Raster key={`pic-${f.id}`} columns={picture.columns} rows={picture.rows} cells={picture.cells} />}
+                    {Image && typeof picture === 'object' && 'file' in picture && (() => {
+                      // a narrow pane shrinks the box, both ways, so the picture keeps its shape
+                      const columns = Math.min(picture.columns, Math.max(4, width - 6))
+                      const rows = Math.max(1, Math.round((picture.rows * columns) / picture.columns))
+                      return <Image key={`pic-${f.id}`} source={{ file: picture.file, format: 'png' }} columns={columns} rows={rows} alt={`🖼  ${f.name}`} />
+                    })()}
+                    {Raster && typeof picture === 'object' && 'cells' in picture && <Raster key={`pic-${f.id}`} columns={picture.columns} rows={picture.rows} cells={picture.cells} />}
                     {picture === 'loading' && <Text dimColor>🖼  loading image…</Text>}
                     <Box key={`file-${f.id}`} flexDirection="row" alignSelf="flex-start" borderStyle="round"
                       borderColor="suggestion" paddingX={1} hover={{ borderColor: 'claude' }}>
@@ -967,7 +1253,7 @@ export const register: Register = on => {
                   await discardPasted($)
                   await loadMessages($, v.convId)
                 })} />
-              <Button key="image-cancel" label="Cancel" onPress={() => void discardPasted($)} />
+              <Button key="image-cancel" label="Cancel" onPress={() => void touch($).then(() => discardPasted($))} />
             </Box>
           )}
           <Box marginTop={1}>
@@ -982,6 +1268,7 @@ export const register: Register = on => {
             <Box flexGrow={1}>
             <Input key={replyKey} placeholder="Write a message…" submitLabel="send" autoFocus value={draftText}
               onInput={(text: string) => {
+                void touch($)
                 if ((text !== '') !== isTyped) void update($, hasReplyText, () => text !== '')
               }}
               onSubmit={(text: string) => {

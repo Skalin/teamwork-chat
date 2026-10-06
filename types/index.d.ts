@@ -34,7 +34,10 @@ export type TwMessage = {
 
 export type TwRaster = { columns: number; rows: number; cells: string }
 
-export type TwPicture = TwRaster | 'loading' | 'failed'
+// a PNG the terminal draws as real pixels (kitty graphics), sized in cells
+export type TwPhoto = { columns: number; rows: number; file: string }
+
+export type TwPicture = TwRaster | TwPhoto | 'loading' | 'failed'
 
 export type TwPastedImage = {
   path: string
@@ -70,6 +73,7 @@ declare module 'claude-code' {
       isSuggesting: boolean
       replyGeneration: number
       hasReplyText: boolean
+      retryIn: number | null
     }
   }
 }
