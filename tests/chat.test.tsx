@@ -37,13 +37,16 @@ const everyone = [
 
 const reply = (data: unknown) => ({ value: { content: [{ type: 'text', text: JSON.stringify(data) }], isError: false } })
 
-function engine(on: On) {
+function engine(on: On, opened: unknown[] = []) {
   const sent: { tool: string; args: unknown }[] = []
   mock.store(on)
-  mock.clock(on)
+  const clock = mock.clock(on)
   on('session.start', () => ({ cwd: '/' }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', ($, e) => {
+    opened.push(e)
+    return { value: { isPlaced: true } }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('ui.render', () => h('Text', {}, 'engine'))
   on('ui.toast', () => ({ value: undefined }))
@@ -72,7 +75,7 @@ function engine(on: On) {
       default: return reply({})
     }
   })
-  return sent
+  return Object.assign(sent, { clock })
 }
 
 const BAND = {
@@ -369,4 +372,27 @@ test('a long address in a message is drawn as one link', async ($, on) => {
   engine(on)
   const pane = await openConversation($)
   expect((await pane.find({ type: 'Link' }))?.props).toMatchObject({ href: gif })
+})
+
+async function startDocking($: any, on: On, env: Record<string, string>) {
+  const opened: unknown[] = []
+  const { clock } = engine(on, opened)
+  mock.env(on, env)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, viewport: { columns: 200, rows: 50, isFullscreen: true } as any })
+  await clock.advance(1) // the dock is opened on the next tick
+  await band.unmount()
+  return opened
+}
+
+test('a TEAMWORK_CHAT_DOCK session docks the chat wide and keeps the Claude column visible', async ($, on) => {
+  const opened = await startDocking($, on, { TEAMWORK_CHAT_DOCK: '1' })
+  expect(opened).toEqual([expect.objectContaining({ id: 'teamwork-chat', columns: 150 })])
+  // focus mode is off, so a Claude reply is drawn (the routines overview lives there)
+  const reply = await $.ui.mount({ plugin: 'teamwork-chat', surface: 'terminal', component: 'AssistantMessage', props: {} as any })
+  expect(await reply.find({ type: 'Text', text: 'engine' })).toBeDefined()
+})
+
+test('an ordinary fullscreen session does not open the chat by itself', async ($, on) => {
+  expect(await startDocking($, on, {})).toEqual([])
 })

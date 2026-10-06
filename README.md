@@ -54,6 +54,17 @@ In auto mode, give the mod's Teamwork calls an allow rule in your `settings.json
 }
 ```
 
+## A status launcher
+
+The chat does not open by itself in ordinary sessions. For a session that is all about status, start Claude with `TEAMWORK_CHAT_DOCK=1` in the fullscreen layout: the mod then docks Teamwork Chat as a wide sidebar right away and keeps the Claude conversation visible beside it. A shell function makes it one command, here also asking Claude for an overview of your scheduled routines:
+
+```bash
+claude-status() {
+  TEAMWORK_CHAT_DOCK=1 claude --settings '{"tui":"fullscreen"}' "$@" \
+    '/schedule list my routines: for each its name, schedule, when it last ran and whether that run succeeded, as one compact table; flag failed runs with the reason. Read only: change nothing.'
+}
+```
+
 ## Commands
 
 | Command | What it does |

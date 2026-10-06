@@ -577,6 +577,8 @@ async function showPane($: $, mode: TwView): Promise<void> {
 
 export const register: Register = on => {
   let isDocked = false
+  // A session started with TEAMWORK_CHAT_DOCK=1 (the claude-status launcher) docks the chat as its main view.
+  let isLauncher = false
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'tw', description: 'Teamwork Chat: open conversations (/tw unread for unread only)' })
@@ -587,11 +589,15 @@ export const register: Register = on => {
     })
     await $.command.register({ name: 'tw-focus', description: 'Teamwork Chat: hide or show the Claude conversation' })
 
+    isLauncher = (await $.env.get('TEAMWORK_CHAT_DOCK')) === '1'
+
     void (async () => {
       const stored = (await $.store.get('seen')) as Record<string, number> | undefined
       if (stored) await update($, seen, () => stored)
       const focus = await $.store.get('isFocus')
-      if (typeof focus === 'boolean') await update($, isFocus, () => focus)
+      // the launcher keeps the Claude column visible (it shows the routines); elsewhere the stored choice
+      if (isLauncher) await update($, isFocus, () => false)
+      else if (typeof focus === 'boolean') await update($, isFocus, () => focus)
       try {
         const user = await tw($, 'get_current_user')
         await update($, me, () => user.account?.user?.id ?? user.account?.id ?? user.user?.id ?? null)
@@ -680,9 +686,9 @@ export const register: Register = on => {
     const focus = await read($, isFocus)
     const unread = list.filter(c => isUnread(c, seenMap, myId))
 
-    // In the fullscreen layout a pane docks beside the transcript: seat it once, wide, as the main view.
+    // A launcher session in the fullscreen layout seats the pane once, wide, beside the transcript.
     const viewport = e.viewport
-    if (viewport?.isFullscreen === true && !isDocked) {
+    if (isLauncher && viewport?.isFullscreen === true && !isDocked) {
       isDocked = true
       const columns = Math.max(60, viewport.columns - CLAUDE_COLUMNS)
       $.clock.after(0, () => void $.ui.open({ id: PANE, title: 'Teamwork Chat', columns }))
