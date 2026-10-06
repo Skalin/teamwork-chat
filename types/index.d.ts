@@ -67,6 +67,7 @@ declare module 'claude-code' {
       isBusy: boolean
       isFocus: boolean
       pasted: TwPastedImage | null
+      sending: { step: string; frame: number; seconds: number } | null
       siteUrl: string | null
       pictures: Record<string, TwPicture>
       suggestion: { convId: number; text: string } | null
