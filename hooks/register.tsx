@@ -63,6 +63,24 @@ export function columnsOf(text: string): number {
   return n
 }
 
+// Web addresses in a message become real links (OSC 8 on the terminal), so a link that wraps
+// over several lines still opens as one; trailing punctuation stays outside it.
+const URL_PATTERN = /https?:\/\/[^\s<>"'`]+/g
+
+export function splitLinks(text: string): Array<string | { href: string }> {
+  const parts: Array<string | { href: string }> = []
+  let at = 0
+  for (const match of text.matchAll(URL_PATTERN)) {
+    const href = match[0].replace(/[.,;:!?)\]}]+$/, '')
+    const start = match.index ?? 0
+    if (start > at) parts.push(text.slice(at, start))
+    parts.push({ href })
+    at = start + href.length
+  }
+  if (at < text.length) parts.push(text.slice(at))
+  return parts
+}
+
 function oneLine(text: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim()
   return flat.length > max ? flat.slice(0, Math.max(1, max - 1)) + '…' : flat
@@ -908,7 +926,7 @@ export const register: Register = on => {
                   <Text dimColor>{clock(m.createdAt)}</Text>
                 </Box>
                 <Box flexDirection="column" paddingLeft={3}>
-              {m.body !== '' && <Text wrap="wrap">{m.body}</Text>}
+              {m.body !== '' && <Text wrap="wrap">{splitLinks(m.body).map(part => (typeof part === 'string' ? part : <Link href={part.href} />))}</Text>}
               {m.file && (() => {
                 const f = m.file
                 const picture = drawn[String(f.id)]

@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { columnsOf, pictureSize, rasterFrom } from '../hooks/register.tsx'
+import { columnsOf, pictureSize, rasterFrom, splitLinks } from '../hooks/register.tsx'
 
 const ME = 1
 const ANNA = 2
@@ -332,4 +332,20 @@ test('columnsOf counts wide emoji as two columns, so badge frames line up', asyn
   expect(columnsOf(' 📋 Paste image ')).toBe(16)
   expect(columnsOf(' ← Back ')).toBe(8)
   expect(columnsOf(' ⟳ Refresh ')).toBe(11)
+})
+
+test('addresses in a message become links, whole even when long', async () => {
+  const gif = 'https://static.klipy.com/ii/c3a19a0b747a76e98651f2b9a3cca5ff/5e/d2/ifgTFHB9.gif'
+  expect(splitLinks(gif)).toEqual([{ href: gif }])
+  expect(splitLinks(`Mrkni (${gif}), díky.`)).toEqual(['Mrkni (', { href: gif }, '), díky.'])
+  expect(splitLinks('bez odkazu')).toEqual(['bez odkazu'])
+})
+
+test('a long address in a message is drawn as one link', async ($, on) => {
+  const gif = 'https://static.klipy.com/ii/c3a19a0b747a76e98651f2b9a3cca5ff/5e/d2/ifgTFHB9.gif'
+  on('mcp.call', { tool: 'twchat-list_messages' }, () =>
+    reply({ messages: [{ id: 101, body: `koukni ${gif}`, createdAt: '2026-10-05T15:07:00.000Z', author: { id: ANNA, fullName: 'Anna Nová' }, file: {} }] }))
+  engine(on)
+  const pane = await openConversation($)
+  expect((await pane.find({ type: 'Link' }))?.props).toMatchObject({ href: gif })
 })
