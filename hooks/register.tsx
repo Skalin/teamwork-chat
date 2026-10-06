@@ -1109,7 +1109,7 @@ export const register: Register = (on, options) => {
         // The active tab is no Button (pressing it would do nothing), so it can take colours:
         // a gold rounded badge that turns orange under the pointer, with no inversion.
         return (
-          <Box key={`chip-${key}`} borderStyle="round" borderColor={GOLD} hover={{ scope: 'active-tab', borderColor: ORANGE }}>
+          <Box key={`chip-${key}`} flexShrink={0} borderStyle="round" borderColor={GOLD} hover={{ scope: 'active-tab', borderColor: ORANGE }}>
             <Text color={GOLD} bold hover={{ scope: 'active-tab', color: ORANGE }}>{inner}</Text>
           </Box>
         )
@@ -1117,10 +1117,11 @@ export const register: Register = (on, options) => {
       const edge = '─'.repeat(columnsOf(inner))
       // The surface inverts the Button row under the pointer and no Button can opt out, so every
       // row inverts in orange on hover: the whole badge becomes one solid orange block.
-      const invert = { color: ORANGE, inverse: true, dimColor: false } as const
+      // one scope per badge: its three rows light together, whichever the pointer is on
+      const invert = { scope: `chip-${key}`, color: ORANGE, inverse: true, dimColor: false } as const
       // an engine action (a chord the person bound) presses the badge too, and draws no mark
       return (
-        <Box key={`chip-${key}`} flexDirection="column">
+        <Box key={`chip-${key}`} flexShrink={0} flexDirection="column">
           <Button key={`${key}-top`} plain dimColor hover={invert} label={`╭${edge}╮`} onPress={onPress} />
           <Button key={key} plain dimColor hover={invert} action={action} label={`│${inner}│`} onPress={onPress} />
           <Button key={`${key}-bottom`} plain dimColor hover={invert} label={`╰${edge}╯`} onPress={onPress} />
@@ -1128,8 +1129,8 @@ export const register: Register = (on, options) => {
       )
     }
     const tabs = (
-      <Box flexDirection="row" justifyContent="space-between" marginBottom={1}>
-        <Box flexDirection="row" gap={1}>
+      <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" marginBottom={1}>
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
           {chip('tab-all', 'All', () => void update($, view, (): TwView => ({ mode: 'all' })), v.mode === 'all')}
           {chip('tab-unread', unreadCount > 0 ? `Unread · ${unreadCount}` : 'Unread',
             () => void update($, view, (): TwView => ({ mode: 'unread' })), v.mode === 'unread')}
