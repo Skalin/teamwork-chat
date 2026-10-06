@@ -1,0 +1,1027 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
+
+import type { TwConversation, TwFile, TwMessage, TwPastedImage, TwPerson, TwPicture, TwView } from '../types'
+
+const SERVER = 'claude_ai_Teamwork_com'
+const PANE = 'teamwork-chat'
+const POLL_MS = 60_000
+const PAGES = 3 // list_conversations returns at most 10 per page
+
+const convs = atom({ plugin: 'teamwork-chat', key: 'convs' } as const, [])
+const seen = atom({ plugin: 'teamwork-chat', key: 'seen' } as const, {})
+const me = atom({ plugin: 'teamwork-chat', key: 'me' } as const, null)
+const view = atom({ plugin: 'teamwork-chat', key: 'view' } as const, { mode: 'all' })
+const messages = atom({ plugin: 'teamwork-chat', key: 'messages' } as const, [])
+const people = atom({ plugin: 'teamwork-chat', key: 'people' } as const, [])
+const error = atom({ plugin: 'teamwork-chat', key: 'error' } as const, null)
+const isBusy = atom({ plugin: 'teamwork-chat', key: 'isBusy' } as const, false)
+const siteUrl = atom({ plugin: 'teamwork-chat', key: 'siteUrl' } as const, null)
+const pictures = atom({ plugin: 'teamwork-chat', key: 'pictures' } as const, {})
+const suggestion = atom({ plugin: 'teamwork-chat', key: 'suggestion' } as const, null)
+const isSuggesting = atom({ plugin: 'teamwork-chat', key: 'isSuggesting' } as const, false)
+const pasted = atom({ plugin: 'teamwork-chat', key: 'pasted' } as const, null)
+const isFocus = atom({ plugin: 'teamwork-chat', key: 'isFocus' } as const, true)
+
+// Transcript rows hidden in focus mode; the spinner, command output and dialogs stay.
+const HIDDEN_ROWS = ['UserMessage', 'AssistantMessage', 'ToolUse', 'ToolResult', 'ToolGroup', 'TurnDuration'] as const
+const GOLD = '#d4a017'
+const ORANGE = '#ff8c00'
+const CLAUDE_COLUMNS = 50 // left for the Claude column beside the docked pane
+
+type $ = EngineInterface
+type Json = any
+
+async function tw($: $, tool: string, args: Record<string, unknown> = {}): Promise<Json> {
+  const result = await $.mcp.call(SERVER, `twchat-${tool}`, args)
+  const text = result.content.map(block => block.text ?? '').join('')
+  if (result.isError) throw new Error(text || `${tool} failed`)
+  return text ? JSON.parse(text) : {}
+}
+
+// Emoji the terminal draws two columns wide (✨, ⌛, ✅ …): the BMP ones with emoji presentation.
+const WIDE_BMP = [
+  [0x231a, 0x231b], [0x23e9, 0x23ec], [0x23f0, 0x23f0], [0x23f3, 0x23f3], [0x25fd, 0x25fe], [0x2614, 0x2615],
+  [0x2648, 0x2653], [0x267f, 0x267f], [0x2693, 0x2693], [0x26a1, 0x26a1], [0x26aa, 0x26ab], [0x26bd, 0x26be],
+  [0x26c4, 0x26c5], [0x26ce, 0x26ce], [0x26d4, 0x26d4], [0x26ea, 0x26ea], [0x26f2, 0x26f3], [0x26f5, 0x26f5],
+  [0x26fa, 0x26fa], [0x26fd, 0x26fd], [0x2705, 0x2705], [0x270a, 0x270b], [0x2728, 0x2728], [0x274c, 0x274c],
+  [0x274e, 0x274e], [0x2753, 0x2755], [0x2757, 0x2757], [0x2795, 0x2797], [0x27b0, 0x27b0], [0x27bf, 0x27bf],
+  [0x2b1b, 0x2b1c], [0x2b50, 0x2b50], [0x2b55, 0x2b55],
+] as const
+
+// How many terminal columns text takes: wide emoji count two, joiners and variation selectors none.
+export function columnsOf(text: string): number {
+  let n = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0
+    if (cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f)) continue
+    const isWide = cp >= 0x1f000 || WIDE_BMP.some(([lo, hi]) => cp >= lo && cp <= hi)
+    n += isWide ? 2 : 1
+  }
+  return n
+}
+
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > max ? flat.slice(0, Math.max(1, max - 1)) + '…' : flat
+}
+
+// Lowercase without diacritics, so "zdenek kunc" finds "Zdeněk Kunc".
+function fold(text: string): string {
+  return text.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim()
+}
+
+// Today as HH:MM, otherwise D. M.
+function when(iso: string): string {
+  if (!iso) return ''
+  try {
+    const zone = { timeZone: 'Europe/Prague' } as const
+    const day = (d: Date) => new Intl.DateTimeFormat('cs-CZ', { ...zone, dateStyle: 'short' }).format(d)
+    const at = new Date(iso)
+    return day(at) === day(new Date())
+      ? new Intl.DateTimeFormat('cs-CZ', { ...zone, hour: '2-digit', minute: '2-digit' }).format(at)
+      : new Intl.DateTimeFormat('cs-CZ', { ...zone, day: 'numeric', month: 'numeric' }).format(at)
+  } catch {
+    return iso.slice(5, 10)
+  }
+}
+
+function kindOf(c: TwConversation): string {
+  if (c.type === 'pair') return 'Direct message'
+  const members = c.memberCount > 0 ? ` · ${c.memberCount} people` : ''
+  return (c.type === 'private' ? 'Group' : 'Channel') + members
+}
+
+function iconOf(c: TwConversation): string {
+  return c.type === 'pair' ? '👤' : c.type === 'private' ? '👥' : '#'
+}
+
+function clock(iso: string): string {
+  try {
+    return new Intl.DateTimeFormat('cs-CZ', {
+      timeZone: 'Europe/Prague',
+      day: 'numeric',
+      month: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(iso))
+  } catch {
+    return iso.slice(5, 16).replace('T', ' ')
+  }
+}
+
+export function countLabel(n: number): string {
+  return n >= 100 ? '99+' : String(Math.max(1, n))
+}
+
+// How many messages from others arrived after the last one viewed (at most one page).
+async function countUnread($: $, c: TwConversation, viewed: number, myId: number | null): Promise<number> {
+  try {
+    const r = await tw($, 'list_messages', { conversation_id: c.id, after_message_id: viewed, page_size: 100 })
+    return (r.messages ?? []).filter((m: Json) => m.id > viewed && m.author?.id !== myId).length || 1
+  } catch {
+    return 1
+  }
+}
+
+export function isUnread(c: TwConversation, seenMap: Record<string, number>, myId: number | null): boolean {
+  const viewed = Math.max(c.lastViewedId, seenMap[String(c.id)] ?? 0)
+  return c.latestId > viewed && c.latestAuthorId !== myId
+}
+
+const names = new Map<number, string>()
+
+async function loadPeople($: $): Promise<void> {
+  const cached = (await $.store.get('names')) as Record<string, string> | undefined
+  for (const [id, name] of Object.entries(cached ?? {})) names.set(Number(id), name)
+  for (let offset = 0; offset < 1000; offset += 50) {
+    const page = await tw($, 'list_people', { page_limit: 50, page_offset: offset })
+    for (const p of page.people ?? []) names.set(p.id, `${p.firstName} ${p.lastName}`.trim())
+    if ((page.people ?? []).length === 0 || offset + 50 >= (page.meta?.page?.total ?? 0)) break
+  }
+  await $.store.set('names', Object.fromEntries(names))
+}
+
+function titleOf(raw: Json, myId: number | null): string {
+  if (raw.title) return raw.title
+  const others = (raw.people ?? [])
+    .map((p: Json) => p.id)
+    .filter((id: number) => id !== myId)
+    .map((id: number) => names.get(id) ?? `#${id}`)
+  return others.join(', ') || 'Conversation'
+}
+
+function toConversation(raw: Json, myId: number | null): TwConversation {
+  const m = raw.latestMessage ?? {}
+  return {
+    id: raw.id,
+    title: titleOf(raw, myId),
+    type: raw.type,
+    latestId: m.id ?? 0,
+    latestAuthorId: m.author?.id ?? null,
+    latestAuthor: m.author?.fullName ?? '',
+    latestBody: m.body ?? (m.file?.name ? `[file] ${m.file.name}` : ''),
+    latestAt: m.createdAt ?? raw.lastActivityAt ?? '',
+    lastViewedId: raw.lastViewedMessageId ?? 0,
+    unreadCount: 0,
+    memberCount: (raw.people ?? []).length,
+  }
+}
+
+async function setStatus($: $): Promise<void> {
+  const list = await read($, convs)
+  const seenMap = await read($, seen)
+  const myId = await read($, me)
+  const n = list.filter(c => isUnread(c, seenMap, myId)).length
+  $.ui.status(n > 0 ? `💬 Teamwork: ${n} unread` : undefined)
+}
+
+async function refresh($: $, { isQuiet = false } = {}): Promise<void> {
+  try {
+    const myId = await read($, me)
+    const before = new Map((await read($, convs)).map(c => [c.id, c.latestId]))
+    const fresh: TwConversation[] = []
+    for (let page = 0; page < PAGES; page++) {
+      const r = await tw($, 'list_conversations', {
+        include_message_data: true,
+        page_limit: 10,
+        page_offset: page * 10,
+        sort: 'lastActivityAt',
+        status: 'active',
+      })
+      const batch: Json[] = r.conversations ?? []
+      fresh.push(...batch.map(raw => toConversation(raw, myId)))
+      if (batch.length < 10) break
+    }
+    const seenMap = await read($, seen)
+    await Promise.all(
+      fresh
+        .filter(c => isUnread(c, seenMap, myId))
+        .map(async c => {
+          const viewed = Math.max(c.lastViewedId, seenMap[String(c.id)] ?? 0)
+          c.unreadCount = await countUnread($, c, viewed, myId)
+        }),
+    )
+    await update($, convs, () => fresh)
+    await update($, error, () => null)
+
+    const arrived = fresh.filter(
+      c => before.size > 0 && c.latestId > (before.get(c.id) ?? 0) && isUnread(c, seenMap, myId),
+    )
+    if (!isQuiet && arrived.length > 0) {
+      const c = arrived[0]!
+      const more = arrived.length > 1 ? ` (+${arrived.length - 1} more)` : ''
+      $.ui.toast(`💬 ${c.title} · ${c.latestAuthor}: ${oneLine(c.latestBody, 80)}${more}`, { timeoutMs: 6000 })
+    }
+    await setStatus($)
+
+    const v = await read($, view)
+    if (v.mode === 'conv' && arrived.some(c => c.id === v.convId)) await loadMessages($, v.convId)
+  } catch (err) {
+    await update($, error, () => `Teamwork: ${(err as Error).message}`).catch(() => {})
+  }
+}
+
+function toFile(raw: Json): TwFile | null {
+  if (!raw || typeof raw.id !== 'number') return null
+  const thumbs = Object.values(raw.thumbnails ?? {}) as Json[]
+  // the smallest thumbnail at least 160 px wide is plenty for a terminal drawing
+  const thumb = thumbs.sort((a, b) => a.constraint - b.constraint).find(t => t.constraint >= 160) ?? thumbs.at(-1)
+  return {
+    id: raw.id,
+    name: raw.name ?? 'file',
+    url: raw.url ?? '',
+    contentType: raw.contentType ?? '',
+    bytes: raw.bytes ?? 0,
+    width: raw.width ?? 0,
+    height: raw.height ?? 0,
+    thumbnail: thumb?.url ?? null,
+  }
+}
+
+async function loadMessages($: $, convId: number): Promise<void> {
+  const r = await tw($, 'list_messages', { conversation_id: convId, page_size: 30 })
+  const list: TwMessage[] = (r.messages ?? [])
+    .map((m: Json) => ({
+      id: m.id,
+      author: m.author?.fullName ?? '?',
+      authorId: m.author?.id ?? 0,
+      body: m.body ?? '',
+      createdAt: m.createdAt,
+      file: toFile(m.file),
+    }))
+    .reverse()
+  await update($, messages, () => list)
+  void loadPictures($, list).catch(() => {})
+  const newest = list.at(-1)?.id ?? 0
+  const next = await update($, seen, s => ({ ...s, [String(convId)]: Math.max(s[String(convId)] ?? 0, newest) }))
+  await $.store.set('seen', next)
+  await setStatus($)
+}
+
+async function busy($: $, work: () => Promise<void>): Promise<void> {
+  await update($, isBusy, () => true)
+  try {
+    await work()
+    await update($, error, () => null)
+  } catch (err) {
+    await update($, error, () => (err as Error).message)
+  } finally {
+    await update($, isBusy, () => false)
+  }
+}
+
+async function openConv($: $, convId: number, title: string): Promise<void> {
+  await update($, view, (): TwView => ({ mode: 'conv', convId, title }))
+  await update($, messages, () => [])
+  await busy($, () => loadMessages($, convId))
+}
+
+async function openDm($: $, person: TwPerson): Promise<void> {
+  await busy($, async () => {
+    const r = await tw($, 'get_or_create_dm', { user_id: person.id })
+    const id = r.conversation?.id ?? r.id
+    if (typeof id !== 'number') throw new Error('Could not open the direct conversation')
+    await openConv($, id, person.name)
+  })
+}
+
+async function searchPeople($: $, term: string): Promise<TwPerson[]> {
+  const myId = await read($, me)
+  const r = await tw($, 'list_people', { search_term: term, page_limit: 10 })
+  return (r.people ?? [])
+    .filter((p: Json) => p.id !== myId && !p.deleted)
+    .map((p: Json) => ({ id: p.id, name: `${p.firstName} ${p.lastName}`.trim(), handle: p.handle ?? '' }))
+}
+
+// Saves the image on the Windows clipboard as a PNG and prints "path|width|height|bytes".
+// The PNG flavour keeps the real pixels; the bitmap flavour often comes with an empty alpha
+// channel (an all-black or invisible image), so that one is flattened to 24-bit first.
+const CLIPBOARD_SCRIPT = [
+  '$ErrorActionPreference = "Stop"',
+  'Add-Type -AssemblyName System.Windows.Forms, System.Drawing',
+  '$p = Join-Path $env:TEMP ("tw-paste-" + [guid]::NewGuid().ToString("N") + ".png")',
+  '$png = [System.Windows.Forms.Clipboard]::GetData("PNG")',
+  // if and else stay on one line: the lines are joined with "; ", which would end the if
+  'if ($png -is [System.IO.MemoryStream]) { [System.IO.File]::WriteAllBytes($p, $png.ToArray()) } else { $i = [System.Windows.Forms.Clipboard]::GetImage(); if (-not $i) { exit 3 }; $r = New-Object System.Drawing.Rectangle 0, 0, $i.Width, $i.Height; $i.Clone($r, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb).Save($p, [System.Drawing.Imaging.ImageFormat]::Png) }',
+  '$img = [System.Drawing.Image]::FromFile($p); $w = $img.Width; $h = $img.Height; $img.Dispose()',
+  '"{0}|{1}|{2}|{3}" -f $p, $w, $h, (Get-Item $p).Length',
+].join('; ')
+
+async function grabClipboardImage($: $): Promise<TwPastedImage> {
+  const ran = await $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', CLIPBOARD_SCRIPT], { timeoutMs: 20_000 })
+  if (ran.exitCode === 3) throw new Error('There is no image on the clipboard (copy one first, e.g. Win+Shift+S).')
+  if (ran.exitCode !== 0) throw new Error(`Could not read the clipboard: ${oneLine(ran.stderr || ran.stdout, 160)}`)
+  const [winPath = '', width = '0', height = '0', bytes = '0'] = ran.stdout.trim().split('|')
+  if (!winPath || !(Number(width) > 0) || !(Number(bytes) > 0)) {
+    throw new Error(`Could not save the clipboard image: ${oneLine(ran.stderr || ran.stdout, 160)}`)
+  }
+  const unix = await $.process.run(['wslpath', '-u', winPath])
+  if (unix.exitCode !== 0) throw new Error(`Could not locate the saved image: ${oneLine(unix.stderr, 160)}`)
+  return { path: unix.stdout.trim(), width: Number(width), height: Number(height), bytes: Number(bytes) }
+}
+
+async function discardPasted($: $): Promise<void> {
+  const image = await read($, pasted)
+  await update($, pasted, () => null)
+  if (image) await $.process.run(['rm', '-f', image.path]).catch(() => undefined)
+}
+
+// The site address, as get_current_user answers it: { account: { url } }.
+function siteOf(user: Json): string | null {
+  const url = user?.account?.url ?? user?.url
+  return typeof url === 'string' && url.startsWith('https://') ? url : null
+}
+
+// Teamwork takes an API key as Basic auth (key as the user); a twp_ token may want Bearer instead.
+let workingAuth: string | null = null
+function authHeaders(key: string): string[] {
+  const all = [`Basic ${btoa(`${key}:x`)}`, `Bearer ${key}`]
+  return workingAuth ? [workingAuth, ...all.filter(a => a !== workingAuth)] : all
+}
+
+// The API hands out its load balancer's host; the same path answers on the Teamwork site.
+async function onSite($: $, url: string): Promise<string> {
+  const site = await read($, siteUrl)
+  if (!site || !url) return url
+  try {
+    const parsed = new URL(url)
+    return site.replace(/\/$/, '') + parsed.pathname + parsed.search
+  } catch {
+    return url
+  }
+}
+
+const PICTURE_COLUMNS = 48
+const PICTURE_MAX_ROWS = 16
+
+// Shrinks an image to w x h pixels on white and prints them as one hex string, RRGGBB each.
+const PIXELS_SCRIPT = [
+  'param($path, $w, $h)',
+  'Add-Type -AssemblyName System.Drawing',
+  '$src = [System.Drawing.Image]::FromFile($path)',
+  '$bmp = New-Object System.Drawing.Bitmap ([int]$w), ([int]$h)',
+  '$g = [System.Drawing.Graphics]::FromImage($bmp); $g.Clear([System.Drawing.Color]::White)',
+  '$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic',
+  '$g.DrawImage($src, 0, 0, [int]$w, [int]$h); $g.Dispose(); $src.Dispose()',
+  '$sb = New-Object System.Text.StringBuilder',
+  'for ($y = 0; $y -lt $bmp.Height; $y++) { for ($x = 0; $x -lt $bmp.Width; $x++) { $c = $bmp.GetPixel($x, $y); [void]$sb.Append($c.R.ToString("x2") + $c.G.ToString("x2") + $c.B.ToString("x2")) } }',
+  '$sb.ToString()',
+].join('\n')
+
+export function pictureSize(file: Pick<TwFile, 'width' | 'height'>): { columns: number; rows: number } {
+  const columns = Math.max(4, Math.min(PICTURE_COLUMNS, file.width || PICTURE_COLUMNS))
+  const ratio = file.width > 0 && file.height > 0 ? file.height / file.width : 0.5
+  // a cell is about twice as tall as wide and holds two pixels stacked, so one row per two pixel rows
+  const rows = Math.max(1, Math.min(PICTURE_MAX_ROWS, Math.round((columns * ratio) / 2)))
+  return { columns, rows }
+}
+
+// Upper-half blocks: the top pixel is the glyph's colour, the bottom one the background.
+export function rasterFrom(hex: string, columns: number, rows: number): string {
+  const words = new Uint32Array(columns * rows * 3)
+  const at = (x: number, y: number) => parseInt(hex.slice((y * columns + x) * 6, (y * columns + x) * 6 + 6), 16) || 0
+  for (let row = 0; row < rows; row++) {
+    for (let x = 0; x < columns; x++) {
+      const i = (row * columns + x) * 3
+      words[i] = 0x2580
+      words[i + 1] = at(x, row * 2)
+      words[i + 2] = at(x, row * 2 + 1)
+    }
+  }
+  const bytes = new Uint8Array(words.buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!)
+  return btoa(binary)
+}
+
+async function drawPicture($: $, file: TwFile, key: string): Promise<TwPicture> {
+  const source = await onSite($, file.thumbnail ?? file.url)
+  const local = `/tmp/tw-thumb-${file.id}`
+  // the key goes to curl on stdin, never in its arguments
+  for (const authorization of authHeaders(key)) {
+    const got = await $.process.run(
+      ['curl', '-sS', '--fail', '-L', '--max-time', '30', '-K', '-', '-o', local, source],
+      { stdin: `header = "Authorization: ${authorization}"\n`, timeoutMs: 40_000 },
+    )
+    if (got.exitCode === 0) {
+      workingAuth = authorization
+      break
+    }
+    if (authorization === authHeaders(key).at(-1)) return 'failed'
+  }
+  const win = await $.process.run(['wslpath', '-w', local])
+  const { columns, rows } = pictureSize(file)
+  const pixels = await $.process.run(
+    ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+      `& { ${PIXELS_SCRIPT} } '${win.stdout.trim().replace(/'/g, "''")}' ${columns} ${rows * 2}`],
+    { timeoutMs: 30_000 },
+  )
+  await $.process.run(['rm', '-f', local]).catch(() => undefined)
+  const hex = pixels.stdout.trim()
+  if (pixels.exitCode !== 0 || hex.length < columns * rows * 2 * 6) return 'failed'
+  return { columns, rows, cells: rasterFrom(hex, columns, rows) }
+}
+
+async function loadPictures($: $, list: TwMessage[]): Promise<void> {
+  const key = await apiKey($)
+  if (!key) return
+  const have = await read($, pictures)
+  const wanted = list
+    .map(m => m.file)
+    .filter((f): f is TwFile => f !== null && f.contentType.startsWith('image/') && !(String(f.id) in have))
+  for (const file of wanted) {
+    await update($, pictures, all => ({ ...all, [String(file.id)]: 'loading' as TwPicture }))
+    const picture = await drawPicture($, file, key).catch((): TwPicture => 'failed')
+    await update($, pictures, all => ({ ...all, [String(file.id)]: picture }))
+  }
+}
+
+const UPLOAD_URL = 'https://chat-uploads.teamwork.com/uploads'
+
+// The key lives in teamwork.env inside the Claude config folder (~/.claude-work for claude-work).
+async function keyFile($: $): Promise<string> {
+  const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+  return `${dir.replace(/\/$/, '')}/teamwork.env`
+}
+
+async function apiKey($: $): Promise<string | undefined> {
+  const fromEnv = (await $.env.get('TEAMWORK_API_KEY'))?.trim()
+  if (fromEnv) return fromEnv
+  try {
+    const text = await $.fs.read(await keyFile($))
+    const line = text.split('\n').map(l => l.trim()).find(l => l.startsWith('TEAMWORK_API_KEY='))
+    const value = line?.slice('TEAMWORK_API_KEY='.length).trim().replace(/^['"]|['"]$/g, '')
+    return value || undefined
+  } catch {
+    return undefined
+  }
+}
+
+// The web app's own two steps: upload the file (no login), then post a message carrying its tempId.
+async function sendImage($: $, convId: number, image: TwPastedImage, caption = ''): Promise<void> {
+  const key = await apiKey($)
+  if (!key) {
+    throw new Error(`Put your Teamwork API key in ${await keyFile($)} as TEAMWORK_API_KEY=… (or set it in the environment).`)
+  }
+
+  const up = await $.process.run(
+    ['curl', '-sS', '--fail-with-body', '--max-time', '60', '-F', `file=@${image.path};type=image/png`, UPLOAD_URL],
+    { timeoutMs: 70_000 },
+  )
+  if (up.exitCode !== 0) throw new Error(`Image upload failed: ${oneLine(up.stdout || up.stderr, 160)}`)
+  let tempId: unknown
+  try {
+    tempId = JSON.parse(up.stdout).tempId
+  } catch {
+    tempId = undefined
+  }
+  if (typeof tempId !== 'string') throw new Error(`Image upload gave no tempId: ${oneLine(up.stdout, 160)}`)
+
+  let site = await read($, siteUrl)
+  if (!site) {
+    site = siteOf(await tw($, 'get_current_user'))
+    await update($, siteUrl, () => site)
+  }
+  if (!site) throw new Error('Could not find your Teamwork site address (get_current_user gave no account.url).')
+  const url = `${site.replace(/\/$/, '')}/chat/v7/conversations/${convId}/messages`
+  const body = JSON.stringify({ message: { body: caption, file: { tempId } } })
+  for (const authorization of authHeaders(key)) {
+    const sent = await $.http.fetch(url, {
+      method: 'POST',
+      headers: { authorization, 'content-type': 'application/json', accept: 'application/json' },
+      body,
+    })
+    if (sent.ok) {
+      workingAuth = authorization
+      return
+    }
+    if (sent.status !== 401 && sent.status !== 403) {
+      throw new Error(`Teamwork refused the image message (${sent.status}): ${oneLine(sent.text, 160)}`)
+    }
+  }
+  throw new Error('Teamwork did not accept TEAMWORK_API_KEY (401/403). Check the key.')
+}
+
+// Opens a web address in the Windows default browser (WSL), else the Linux one.
+async function openInBrowser($: $, url: string): Promise<void> {
+  if (!/^https:\/\//.test(url)) throw new Error('Only https links are opened.')
+  // explorer.exe hands the URL to the default browser; it reports exit code 1 even when it worked
+  const viaWindows = await $.process.run(['explorer.exe', url]).catch(() => undefined)
+  if (viaWindows) return
+  const viaLinux = await $.process.run(['xdg-open', url]).catch(() => undefined)
+  if (!viaLinux || viaLinux.exitCode !== 0) throw new Error(`Could not open a browser. The link: ${url}`)
+}
+
+function sizeLabel(bytes: number): string {
+  return bytes >= 1_048_576 ? `${(bytes / 1_048_576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`
+}
+
+// Drafts a reply from the last messages of the open conversation and puts it into the field.
+async function suggestReply($: $, convId: number, title: string): Promise<void> {
+  const myId = await read($, me)
+  const myName = (myId !== null && names.get(myId)) || 'me'
+  const recent = (await read($, messages)).slice(-20)
+  if (recent.length === 0) throw new Error('There are no messages to reply to yet.')
+  const transcript = recent
+    .map(m => `${m.authorId === myId ? `${myName} (me)` : m.author}: ${m.body || (m.file ? `[file: ${m.file.name}]` : '')}`)
+    .join('\n')
+  await update($, isSuggesting, () => true)
+  try {
+    const r = await $.model.complete({
+      model: 'sonnet',
+      maxTokens: 400,
+      system:
+        `You draft the next chat message for ${myName} in a Teamwork Chat conversation ("${title}"). ` +
+        'Write in the language and tone the conversation uses, briefly, as a colleague would. ' +
+        'Answer with the message text only: no quotes, no name, no explanation.',
+      prompt: `The conversation so far, oldest first:\n\n${transcript}\n\nWrite ${myName}'s next message.`,
+    })
+    if (!r.isAnswered) throw new Error(`Could not draft a reply (${r.reason}).`)
+    const text = r.text.trim().replace(/^["„“]|["“”]$/g, '')
+    await update($, suggestion, () => ({ convId, text }))
+  } finally {
+    await update($, isSuggesting, () => false)
+  }
+}
+
+async function openFromBadge($: $, c: TwConversation): Promise<void> {
+  await $.ui.open({ id: PANE, title: 'Teamwork Chat', focus: true })
+  await openConv($, c.id, c.title)
+}
+
+async function showPane($: $, mode: TwView): Promise<void> {
+  await update($, view, () => mode)
+  await $.ui.open({ id: PANE, title: 'Teamwork Chat', focus: true })
+}
+
+export const register: Register = on => {
+  let isDocked = false
+
+  on('session.start', async ($, e, next) => {
+    await $.command.register({ name: 'tw', description: 'Teamwork Chat: open conversations (/tw unread for unread only)' })
+    await $.command.register({
+      name: 'tw-dm',
+      description: 'Teamwork Chat: send a direct message',
+      argumentHint: '<name surname | @handle> <message>',
+    })
+    await $.command.register({ name: 'tw-focus', description: 'Teamwork Chat: hide or show the Claude conversation' })
+
+    void (async () => {
+      const stored = (await $.store.get('seen')) as Record<string, number> | undefined
+      if (stored) await update($, seen, () => stored)
+      const focus = await $.store.get('isFocus')
+      if (typeof focus === 'boolean') await update($, isFocus, () => focus)
+      try {
+        const user = await tw($, 'get_current_user')
+        await update($, me, () => user.account?.user?.id ?? user.account?.id ?? user.user?.id ?? null)
+        await update($, siteUrl, () => siteOf(user))
+        await loadPeople($)
+      } catch (err) {
+        await update($, error, () => `Teamwork: ${(err as Error).message}`)
+      }
+      await refresh($, { isQuiet: true })
+      $.clock.every(POLL_MS, () => void refresh($))
+    })().catch(() => {})
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'tw' }, async ($, e) => {
+    await refresh($, { isQuiet: true })
+    await showPane($, e.args.trim() === 'unread' ? { mode: 'unread' } : { mode: 'all' })
+    return { text: 'Teamwork Chat opened.' }
+  })
+
+  on('command.run', { command: 'tw-focus' }, async $ => {
+    const now = await update($, isFocus, value => !value)
+    await $.store.set('isFocus', now)
+    return { text: now ? 'Claude conversation hidden.' : 'Claude conversation shown.' }
+  })
+
+  on('ui.render', { component: HIDDEN_ROWS }, async ($, e, next) => {
+    // ctrl+o (expanded transcript) still shows everything
+    const isExpanded = (e.props as { isExpanded?: boolean }).isExpanded === true
+    if (isExpanded || !(await read($, isFocus))) return next(e)
+    const { Box } = $.ui.resolve(e)
+    return <Box display="none" />
+  })
+
+  on('command.run', { command: 'tw-dm' }, async ($, e) => {
+    const usage = { text: 'Usage: /tw-dm <name surname | @handle> <message>' }
+    const words = e.args.trim().split(/\s+/).filter(Boolean)
+    if (words.length < 2) return usage
+
+    let person: TwPerson | undefined
+    let body = ''
+    if (words[0]!.startsWith('@')) {
+      const handle = words[0]!.slice(1)
+      const found = await searchPeople($, handle)
+      person = found.find(p => fold(p.handle) === fold(handle)) ?? (found.length === 1 ? found[0] : undefined)
+      body = words.slice(1).join(' ')
+      if (!person) return { text: `Nobody in Teamwork Chat has the handle @${handle}.` }
+    } else {
+      // The name is the longest run of leading words that a person's full name starts with.
+      const found = await searchPeople($, words[0]!)
+      let best: { people: TwPerson[]; count: number } = { people: [], count: 0 }
+      // Up to every word, so a bare "Name Surname" is caught as having no message.
+      for (let count = Math.min(words.length, 4); count >= 1; count--) {
+        const typed = fold(words.slice(0, count).join(' '))
+        const hits = found.filter(p => {
+          const name = fold(p.name)
+          return name === typed || name.startsWith(typed + ' ')
+        })
+        if (hits.length > 0) {
+          best = { people: hits, count }
+          break
+        }
+      }
+      if (best.people.length === 0) return { text: `Nobody in Teamwork Chat matches "${words[0]}".` }
+      if (best.people.length > 1) {
+        return {
+          text: `"${words.slice(0, best.count).join(' ')}" matches several people, add the surname or use @handle: ${best.people.map(p => `${p.name} (@${p.handle})`).join(', ')}`,
+        }
+      }
+      person = best.people[0]!
+      body = words.slice(best.count).join(' ')
+    }
+    if (!body) return usage
+    await tw($, 'send_dm', { user_id: person.id, body })
+    void refresh($, { isQuiet: true })
+    return { text: `Sent to ${person.name}.` }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const list = await read($, convs)
+    const seenMap = await read($, seen)
+    const myId = await read($, me)
+    const err = await read($, error)
+    const focus = await read($, isFocus)
+    const unread = list.filter(c => isUnread(c, seenMap, myId))
+
+    // In the fullscreen layout a pane docks beside the transcript: seat it once, wide, as the main view.
+    const viewport = e.viewport
+    if (viewport?.isFullscreen === true && !isDocked) {
+      isDocked = true
+      const columns = Math.max(60, viewport.columns - CLAUDE_COLUMNS)
+      $.clock.after(0, () => void $.ui.open({ id: PANE, title: 'Teamwork Chat', columns }))
+    }
+
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const width = e.props.bodyColumns
+    const isNarrow = width < 45
+    const toggle = (
+      <Button key="tw-focus" label={focus ? 'Show Claude' : 'Hide Claude'} hotkey="c" dimColor
+        onPress={() => void (async () => {
+          const now = await update($, isFocus, value => !value)
+          await $.store.set('isFocus', now)
+        })()} />
+    )
+    const open = (
+      <Button key="tw-open" label="Open" hotkey="t"
+        onPress={() => void showPane($, unread.length > 0 ? { mode: 'unread' } : { mode: 'all' })} />
+    )
+
+    if (isNarrow) {
+      return (
+        <Box>
+          <Text color={unread.length > 0 ? 'warning' : undefined} bold>
+            💬 {err ? '!' : unread.length === 0 ? '0' : countLabel(unread.reduce((sum, c) => sum + c.unreadCount, 0))}{' '}
+          </Text>
+          {open}
+          {toggle}
+        </Box>
+      )
+    }
+
+    let state
+    if (err) state = <Text color="error" wrap="truncate">{oneLine(err, Math.max(10, width - 45))} </Text>
+    else if (list.length === 0) state = <Text dimColor>connecting… </Text>
+    else if (unread.length === 0) state = <Text color="success">no unread </Text>
+    else {
+      // one line of badges, as many as fit, then "+N"
+      let room = Math.max(12, width - 45)
+      const fits: TwConversation[] = []
+      for (const c of unread) {
+        const cost = Math.min(c.title.length, 18) + countLabel(c.unreadCount).length + 4
+        if (cost > room && fits.length > 0) break
+        fits.push(c)
+        room -= cost
+      }
+      const rest = unread.length - fits.length
+      state = (
+        <Box flexDirection="row" gap={1}>
+          {fits.map(c => (
+            <Box key={`band-${c.id}`} flexDirection="row">
+              <Button key={`bb-${c.id}`} plain label={oneLine(c.title, 18)} onPress={() => void openFromBadge($, c)} />
+              <Text backgroundColor="warning" color="inverseText" bold> {countLabel(c.unreadCount)} </Text>
+            </Box>
+          ))}
+          {rest > 0 && <Text dimColor>+{rest}</Text>}
+          <Text> </Text>
+        </Box>
+      )
+    }
+    return (
+      <Box>
+        <Text bold>💬 Teamwork · </Text>
+        {state}
+        {open}
+        {toggle}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    if (e.surface === 'mobile') {
+      const { Text } = $.ui.resolve(e)
+      return <Text dimColor>Teamwork Chat needs a terminal or desktop surface.</Text>
+    }
+    const table = $.ui.resolve(e)
+    const { Box, Button, Input, Link, Text } = table
+    // only the terminal draws cell grids; elsewhere the file link stands alone
+    const Raster = 'Raster' in table ? table.Raster : undefined
+    const width = e.props.bodyColumns
+    const v = await read($, view)
+    const list = await read($, convs)
+    const seenMap = await read($, seen)
+    const myId = await read($, me)
+    const err = await read($, error)
+    const loading = await read($, isBusy)
+    const unreadCount = list.filter(c => isUnread(c, seenMap, myId)).length
+
+    // Tabs and actions as framed badges of three Buttons (top edge, label, bottom edge) sharing one
+    // action, so the whole badge is clickable; hovering it inverts all three rows as one block. The
+    // active tab gets a heavy frame and full-strength text; the rest a thin, dim one.
+    const chip = (key: string, label: string, onPress: () => void, isActive = false) => {
+      const inner = ` ${label} `
+      if (isActive) {
+        // The active tab is no Button (pressing it would do nothing), so it can take colours:
+        // a gold rounded badge that turns orange under the pointer, with no inversion.
+        return (
+          <Box key={`chip-${key}`} borderStyle="round" borderColor={GOLD} hover={{ scope: 'active-tab', borderColor: ORANGE }}>
+            <Text color={GOLD} bold hover={{ scope: 'active-tab', color: ORANGE }}>{inner}</Text>
+          </Box>
+        )
+      }
+      const edge = '─'.repeat(columnsOf(inner))
+      // The surface inverts the Button row under the pointer and no Button can opt out, so every
+      // row inverts in orange on hover: the whole badge becomes one solid orange block.
+      const invert = { color: ORANGE, inverse: true, dimColor: false } as const
+      return (
+        <Box key={`chip-${key}`} flexDirection="column">
+          <Button key={`${key}-top`} plain dimColor hover={invert} label={`╭${edge}╮`} onPress={onPress} />
+          <Button key={key} plain dimColor hover={invert} label={`│${inner}│`} onPress={onPress} />
+          <Button key={`${key}-bottom`} plain dimColor hover={invert} label={`╰${edge}╯`} onPress={onPress} />
+        </Box>
+      )
+    }
+    const tabs = (
+      <Box flexDirection="row" justifyContent="space-between" marginBottom={1}>
+        <Box flexDirection="row" gap={1}>
+          {chip('tab-all', 'All', () => void update($, view, (): TwView => ({ mode: 'all' })), v.mode === 'all')}
+          {chip('tab-unread', unreadCount > 0 ? `Unread · ${unreadCount}` : 'Unread',
+            () => void update($, view, (): TwView => ({ mode: 'unread' })), v.mode === 'unread')}
+          {chip('tab-people', '✎ New message', () => void update($, view, (): TwView => ({ mode: 'people' })), v.mode === 'people')}
+        </Box>
+        {/* the pane's own close mark sits on its frame, so no close badge here */}
+        {chip('refresh', '⟳ Refresh', () => void refresh($, { isQuiet: true }))}
+      </Box>
+    )
+
+    let body
+    if (v.mode === 'all' || v.mode === 'unread') {
+      const shown = v.mode === 'unread' ? list.filter(c => isUnread(c, seenMap, myId)) : list
+      body = (
+        <Box flexDirection="column">
+          {shown.length === 0 && <Text dimColor>{v.mode === 'unread' ? 'No unread conversations.' : 'Loading…'}</Text>}
+          {shown.map(c => {
+            const isNew = isUnread(c, seenMap, myId)
+            const last = c.latestAuthorId === myId ? 'You' : (c.latestAuthor.split(' ')[0] ?? '')
+            const time = when(c.latestAt)
+            const pill = isNew ? ` ${countLabel(c.unreadCount)} ` : ''
+            // Both lines are full-width Buttons, so a click anywhere on the card opens it.
+            const lineWidth = Math.max(20, width - 3 - (isNew ? pill.length + 1 : 0))
+            const icon = `${iconOf(c)} `
+            const titleRoom = Math.max(8, lineWidth - icon.length - time.length - 2)
+            const head = icon + oneLine(c.title, titleRoom)
+            const firstLine = head + ' '.repeat(Math.max(1, lineWidth - head.length - time.length)) + time
+            const preview = oneLine(`   ${last}: ${c.latestBody || '…'}`, Math.max(20, width - 3))
+            const open = () => void openConv($, c.id, c.title)
+            // the surface inverts the line under the pointer; inverting both lines keeps the card one block
+            const rowHover = { inverse: true, dimColor: false } as const
+            return (
+              <Box key={`row-${c.id}`} flexDirection="row" marginBottom={1}>
+                <Text color={isNew ? 'warning' : 'subtle'}>{isNew ? '▌' : '│'} </Text>
+                <Box flexDirection="column" flexGrow={1}>
+                  <Box flexDirection="row">
+                    <Button key={`c-${c.id}`} plain dimColor={!isNew} hover={rowHover} label={firstLine} onPress={open} />
+                    {isNew && <Text> </Text>}
+                    {isNew && <Text backgroundColor="warning" color="inverseText" bold>{pill}</Text>}
+                  </Box>
+                  <Button key={`cp-${c.id}`} plain dimColor hover={rowHover}
+                    label={preview + ' '.repeat(Math.max(0, width - 3 - preview.length))} onPress={open} />
+                </Box>
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    } else if (v.mode === 'conv') {
+      const msgs = await read($, messages)
+      // Show the newest messages that fit, so the header and the reply row stay on screen.
+      const back = () => void (async () => {
+        await discardPasted($)
+        await update($, suggestion, () => null)
+        await update($, view, (): TwView => ({ mode: 'all' }))
+      })()
+      const image = await read($, pasted)
+      const drafting = await read($, isSuggesting)
+      const suggested = await read($, suggestion)
+      const draftText = suggested?.convId === v.convId ? suggested.text : undefined
+      const drawn = await read($, pictures)
+      const site = await read($, siteUrl)
+      const linkOf = (f: TwFile) => {
+        if (!site || !f.url) return f.url
+        try {
+          const parsed = new URL(f.url)
+          return site.replace(/\/$/, '') + parsed.pathname
+        } catch {
+          return f.url
+        }
+      }
+      const conv = list.find(c => c.id === v.convId)
+      let room = Math.max(6, (e.props.scroll?.bodyRows ?? 30) - 14)
+      let from = msgs.length
+      while (from > 0) {
+        const m = msgs[from - 1]!
+        const textRows = m.body.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / Math.max(20, width - 5))), 0)
+        const fileRows = m.file ? 2 + (m.file.contentType.startsWith('image/') ? pictureSize(m.file).rows : 0) : 0
+        const rows = 2 + textRows + fileRows
+        if (rows > room && from < msgs.length) break
+        room -= rows
+        from--
+      }
+      const visible = msgs.slice(from)
+      body = (
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={1} marginBottom={1} alignItems="center">
+            {chip('back', '← Back', back)}
+            <Box flexDirection="row" flexGrow={1}>
+              <Text color="warning">{'▌\n▌'}</Text>
+              <Box flexDirection="column" marginLeft={1}>
+                <Text bold>{conv ? iconOf(conv) : '💬'} {oneLine(v.title, Math.max(8, width - 40))}</Text>
+                <Text dimColor>{conv ? kindOf(conv) : 'Conversation'}</Text>
+              </Box>
+            </Box>
+            {chip('suggest', drafting ? '✨ Writing…' : '✨ Suggest reply', () => {
+              if (!drafting) void busy($, () => suggestReply($, v.convId, v.title))
+            })}
+          </Box>
+          {msgs.length === 0 && <Text dimColor>{loading ? 'Loading…' : 'No messages.'}</Text>}
+          {from > 0 && <Text dimColor>↑ {from} older {from === 1 ? 'message' : 'messages'}</Text>}
+          {visible.map(m => {
+            const isMine = m.authorId === myId
+            return (
+            // the list's card: a bar, the author with the time on the right, the content indented below
+            <Box flexDirection="row" marginTop={1}>
+              <Text color={isMine ? 'suggestion' : 'subtle'}>{isMine ? '▌' : '│'} </Text>
+              <Box flexDirection="column" flexGrow={1}>
+                <Box flexDirection="row" justifyContent="space-between">
+                  <Text bold color={isMine ? 'suggestion' : undefined}>{isMine ? 'You' : m.author}</Text>
+                  <Text dimColor>{clock(m.createdAt)}</Text>
+                </Box>
+                <Box flexDirection="column" paddingLeft={3}>
+              {m.body !== '' && <Text wrap="wrap">{m.body}</Text>}
+              {m.file && (() => {
+                const f = m.file
+                const picture = drawn[String(f.id)]
+                const href = linkOf(f)
+                return (
+                  <Box flexDirection="column">
+                    {Raster && typeof picture === 'object' && <Raster key={`pic-${f.id}`} columns={picture.columns} rows={picture.rows} cells={picture.cells} />}
+                    {picture === 'loading' && <Text dimColor>🖼  loading image…</Text>}
+                    <Box key={`file-${f.id}`} flexDirection="row" alignSelf="flex-start" borderStyle="round"
+                      borderColor="suggestion" paddingX={1} hover={{ borderColor: 'claude' }}>
+                      <Button key={`open-${f.id}`} plain
+                        label={`${f.contentType.startsWith('image/') ? '🖼 ' : '📎'} ${oneLine(f.name, Math.max(10, width - 30))} · ${sizeLabel(f.bytes)}${href ? ' ↗' : ''}`}
+                        onPress={() => {
+                          if (href) void busy($, () => openInBrowser($, href))
+                        }} />
+                    </Box>
+                    {href && <Link href={href} label={href} />}
+                  </Box>
+                )
+              })()}
+                </Box>
+              </Box>
+            </Box>
+            )
+          })}
+          {image && (
+            <Box key="pasted" marginTop={1} flexDirection="row" gap={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
+              <Text>🖼  {image.width}×{image.height} · {sizeLabel(image.bytes)}</Text>
+              <Button key="image-send" label="Send" variant="primary"
+                onPress={() => void busy($, async () => {
+                  await sendImage($, v.convId, image)
+                  await discardPasted($)
+                  await loadMessages($, v.convId)
+                })} />
+              <Button key="image-cancel" label="Cancel" onPress={() => void discardPasted($)} />
+            </Box>
+          )}
+          <Box marginTop={1}>
+            <Button key="paste" label="📋 Paste image" hotkey="v"
+              onPress={() => void busy($, async () => {
+                await discardPasted($)
+                const grabbed = await grabClipboardImage($)
+                await update($, pasted, () => grabbed)
+              })} />
+          </Box>
+          <Box marginTop={1}>
+            <Input key="reply" placeholder="Write a message…" submitLabel="send" autoFocus value={draftText}
+              onSubmit={(text: string) => {
+                void update($, suggestion, () => null)
+                if (!text.trim()) return
+                void busy($, async () => {
+                  await tw($, 'send_message', { conversation_id: v.convId, body: text })
+                  await loadMessages($, v.convId)
+                  await refresh($, { isQuiet: true })
+                })
+              }} />
+          </Box>
+        </Box>
+      )
+    } else {
+      const found = await read($, people)
+      body = (
+        <Box flexDirection="column">
+          <Input key="search" label="To: " placeholder="name or email, Enter to search" submitLabel="search" autoFocus
+            onSubmit={(term: string) => void busy($, async () => {
+              const result = await searchPeople($, term)
+              await update($, people, () => result)
+            })} />
+          {found.map(p => (
+            <Button key={`p-${p.id}`} plain label={oneLine(`${p.name}  @${p.handle}`, width - 2)}
+              onPress={() => void openDm($, p)} />
+          ))}
+        </Box>
+      )
+    }
+
+    const unreadNow = list.filter(c => isUnread(c, seenMap, myId))
+    // Unread cards: one size, so they line up in a grid; both lines open the conversation.
+    const totalUnread = unreadNow.reduce((sum, c) => sum + c.unreadCount, 0)
+    const inner = Math.max(16, Math.min(26, width - 4))
+    const badges = unreadNow.length === 0 ? (
+      list.length > 0 && (
+        <Box flexDirection="row" marginBottom={1}>
+          <Text color="success" bold>✓ All caught up</Text>
+          <Text dimColor> · no unread messages</Text>
+        </Box>
+      )
+    ) : (
+      <Box flexDirection="column" marginBottom={1}>
+        <Box flexDirection="row">
+          <Text color="warning" bold>🔔 Unread</Text>
+          <Text dimColor>
+            {' '}· {totalUnread} {totalUnread === 1 ? 'message' : 'messages'} in {unreadNow.length}{' '}
+            {unreadNow.length === 1 ? 'conversation' : 'conversations'}
+          </Text>
+        </Box>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+          {unreadNow.map(c => {
+            const pill = ` ${countLabel(c.unreadCount)} `
+            const head = `${iconOf(c)} ${oneLine(c.title, inner - pill.length - 4)}`
+            const who = c.latestAuthorId === myId ? 'You' : (c.latestAuthor.split(' ')[0] ?? '')
+            const preview = oneLine(`${who}: ${c.latestBody || '…'}`, inner)
+            const open = () => void openConv($, c.id, c.title)
+            return (
+              <Box key={`badge-${c.id}`} flexDirection="column" borderStyle="round" borderColor="warning"
+                paddingX={1} hover={{ borderColor: 'claude' }}>
+                <Box flexDirection="row">
+                  <Button key={`pb-${c.id}`} plain hover={{ color: 'claude' }}
+                    label={head + ' '.repeat(Math.max(1, inner - pill.length - head.length))} onPress={open} />
+                  <Text backgroundColor="warning" color="inverseText" bold hover={{ backgroundColor: 'claude' }}>{pill}</Text>
+                </Box>
+                <Button key={`pp-${c.id}`} plain dimColor hover={{ color: 'claude', dimColor: false }}
+                  label={preview + ' '.repeat(Math.max(0, inner - preview.length))} onPress={open} />
+              </Box>
+            )
+          })}
+        </Box>
+      </Box>
+    )
+
+    return (
+      <Box flexDirection="column">
+        {badges}
+        {tabs}
+        {err && <Text color="error">{err}</Text>}
+        {loading && v.mode !== 'conv' && <Text dimColor>Working…</Text>}
+        {body}
+      </Box>
+    )
+  })
+}

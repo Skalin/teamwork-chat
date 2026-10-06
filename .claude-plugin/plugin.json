@@ -1,0 +1,8 @@
+{
+  "name": "teamwork-chat",
+  "version": "0.1.0",
+  "description": "Teamwork Chat inside Claude Code: unread badges, a conversations pane, replies, direct messages, images and suggested replies",
+  "author": { "name": "Dominik Skála" },
+  "repository": "https://github.com/Skalin/teamwork-chat",
+  "types": "./types/index.d.ts"
+}

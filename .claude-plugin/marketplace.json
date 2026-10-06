@@ -1,0 +1,6 @@
+{
+  "name": "teamwork-chat",
+  "owner": { "name": "Dominik Skála" },
+  "metadata": { "description": "Teamwork Chat inside Claude Code" },
+  "plugins": [{ "name": "teamwork-chat", "source": "./" }]
+}

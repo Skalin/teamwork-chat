@@ -1,0 +1,6 @@
+# laid by Claude Code at every load: the API typings and an editor tsconfig
+.claude-plugin/types/
+tsconfig.json
+# never commit a Teamwork API key
+teamwork.env
+*.env
