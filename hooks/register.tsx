@@ -11,6 +11,8 @@ const SERVER = 'claude_ai_Teamwork_com'
 const PANE = 'teamwork-chat'
 const POLL_MS = 30_000
 const RETRY_MS = 5_000 // while the Teamwork connector is still connecting
+const CONV_POLL_MS = 5_000 // an open conversation fetches its newest messages this often
+const CONV_IDLE_MS = 5 * 60_000 // and goes back to the list after this long without activity
 const PAGES = 3 // list_conversations returns at most 10 per page
 
 const convs = atom({ plugin: 'teamwork-chat', key: 'convs' } as const, [])
@@ -279,7 +281,7 @@ async function refresh($: $, { isQuiet = false } = {}): Promise<void> {
     await setStatus($)
 
     const v = await read($, view)
-    if (v.mode === 'conv' && arrived.some(c => c.id === v.convId)) await loadMessages($, v.convId)
+    if (v.mode === 'conv' && arrived.some(c => c.id === v.convId) && (await loadMessages($, v.convId))) await touch($)
   } catch (err) {
     await update($, error, () => `Teamwork: ${(err as Error).message}`).catch(() => {})
   }
@@ -302,7 +304,9 @@ function toFile(raw: Json): TwFile | null {
   }
 }
 
-async function loadMessages($: $, convId: number): Promise<void> {
+// Fetches the conversation's newest messages; true when one arrived since the last fetch.
+// Quiet (the open conversation's poll) writes nothing when nothing changed.
+async function loadMessages($: $, convId: number, { isQuiet = false } = {}): Promise<boolean> {
   const r = await tw($, 'list_messages', { conversation_id: convId, page_size: 30 })
   const list: TwMessage[] = (r.messages ?? [])
     .map((m: Json) => ({
@@ -314,15 +318,71 @@ async function loadMessages($: $, convId: number): Promise<void> {
       file: toFile(m.file),
     }))
     .reverse()
+  // the person may have left (or opened another conversation) while this was fetched
+  const v = await read($, view)
+  if (v.mode !== 'conv' || v.convId !== convId) return false
+  const before = await read($, messages)
+  const isSame = before.length === list.length && before.every((m, i) => m.id === list[i]!.id && m.body === list[i]!.body)
+  if (isQuiet && isSame) return false
+  const hasNew = before.length > 0 && (list.at(-1)?.id ?? 0) > (before.at(-1)?.id ?? 0)
   await update($, messages, () => list)
   void loadPictures($, list).catch(() => {})
   const newest = list.at(-1)?.id ?? 0
   const next = await update($, seen, s => ({ ...s, [String(convId)]: Math.max(s[String(convId)] ?? 0, newest) }))
   await $.store.set('seen', next)
   await setStatus($)
+  return hasNew
+}
+
+let convTimer: { cancel: () => void } | null = null
+let lastActivity = 0
+
+// Something happened in the open conversation (the person did something, a message came), so it stays open.
+async function touch($: $): Promise<void> {
+  lastActivity = await $.clock.now()
+}
+
+async function leaveConv($: $): Promise<void> {
+  convTimer?.cancel()
+  convTimer = null
+  await discardPasted($)
+  await update($, suggestion, () => null)
+  await update($, hasReplyText, () => false)
+  await update($, view, (): TwView => ({ mode: 'all' }))
+}
+
+// While a conversation is open: its newest messages every 5 s, and back to the list after 5 idle minutes.
+function watchConv($: $, convId: number): void {
+  convTimer?.cancel()
+  let isFetching = false
+  const timer = $.clock.every(CONV_POLL_MS, () => void (async () => {
+    const v = await read($, view)
+    if (v.mode !== 'conv' || v.convId !== convId) {
+      timer.cancel()
+      if (convTimer === timer) convTimer = null
+      return
+    }
+    if ((await $.clock.now()) - lastActivity >= CONV_IDLE_MS) {
+      await leaveConv($)
+      $.ui.toast('Teamwork Chat: back to the list after 5 minutes without activity')
+      return
+    }
+    // one fetch at a time, and none while an action of the person's is running
+    if (isFetching || (await read($, isBusy))) return
+    isFetching = true
+    try {
+      if (await loadMessages($, convId, { isQuiet: true })) await touch($)
+    } catch {
+      // the list's own poll shows a connection error; this one just tries again
+    } finally {
+      isFetching = false
+    }
+  })())
+  convTimer = timer
 }
 
 async function busy($: $, work: () => Promise<void>): Promise<void> {
+  await touch($)
   await update($, isBusy, () => true)
   try {
     await work()
@@ -337,7 +397,11 @@ async function busy($: $, work: () => Promise<void>): Promise<void> {
 async function openConv($: $, convId: number, title: string): Promise<void> {
   await update($, view, (): TwView => ({ mode: 'conv', convId, title }))
   await update($, messages, () => [])
-  await busy($, () => loadMessages($, convId))
+  await touch($)
+  watchConv($, convId)
+  await busy($, async () => {
+    await loadMessages($, convId)
+  })
 }
 
 async function openDm($: $, person: TwPerson): Promise<void> {
@@ -1077,12 +1141,7 @@ export const register: Register = (on, options) => {
     } else if (v.mode === 'conv') {
       const msgs = await read($, messages)
       // Show the newest messages that fit, so the header and the reply row stay on screen.
-      const back = () => void (async () => {
-        await discardPasted($)
-        await update($, suggestion, () => null)
-        await update($, hasReplyText, () => false)
-        await update($, view, (): TwView => ({ mode: 'all' }))
-      })()
+      const back = () => void leaveConv($)
       const image = await read($, pasted)
       const drafting = await read($, isSuggesting)
       const suggested = await read($, suggestion)
@@ -1094,6 +1153,7 @@ export const register: Register = (on, options) => {
       const isTyped = await read($, hasReplyText)
       const showClear = isTyped || (draftText ?? '') !== ''
       const clearReply = () => void (async () => {
+        await touch($)
         await update($, suggestion, () => null)
         await update($, hasReplyText, () => false)
         const next = await update($, replyGeneration, n => n + 1)
@@ -1193,7 +1253,7 @@ export const register: Register = (on, options) => {
                   await discardPasted($)
                   await loadMessages($, v.convId)
                 })} />
-              <Button key="image-cancel" label="Cancel" onPress={() => void discardPasted($)} />
+              <Button key="image-cancel" label="Cancel" onPress={() => void touch($).then(() => discardPasted($))} />
             </Box>
           )}
           <Box marginTop={1}>
@@ -1208,6 +1268,7 @@ export const register: Register = (on, options) => {
             <Box flexGrow={1}>
             <Input key={replyKey} placeholder="Write a message…" submitLabel="send" autoFocus value={draftText}
               onInput={(text: string) => {
+                void touch($)
                 if ((text !== '') !== isTyped) void update($, hasReplyText, () => text !== '')
               }}
               onSubmit={(text: string) => {

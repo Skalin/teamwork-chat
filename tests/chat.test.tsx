@@ -530,3 +530,55 @@ test('with chafa installed the mosaic comes from chafa and PowerShell is not ask
   expect(picture?.type).toBe('Raster')
   expect(picture?.props).toMatchObject({ columns: 2, rows: 2 })
 })
+
+const said = (id: number, body: string) =>
+  ({ id, body, createdAt: '2026-10-06T08:00:00.000Z', author: { id: ANNA, fullName: 'Anna Nová' } })
+
+// list_messages of the open conversation (page_size 30), newest first as Teamwork answers
+function liveConversation(on: On, first: unknown[]) {
+  const state = { list: first, fetches: 0 }
+  on('mcp.call', { tool: 'twchat-list_messages' }, ($, e) => {
+    if (e.args.page_size === 30) state.fetches++
+    return reply({ messages: [...state.list].reverse() })
+  })
+  return state
+}
+
+test('an open conversation fetches its newest messages every 5 seconds', async ($, on) => {
+  const live = liveConversation(on, [said(101, 'Ahoj')])
+  const { clock } = engine(on)
+  mock.env(on, {})
+  const pane = await openConversation($)
+  expect(await pane.find({ type: 'Text', text: /Ahoj/ })).toBeDefined()
+
+  const before = live.fetches
+  live.list = [said(101, 'Ahoj'), said(102, 'Jsi tam?')]
+  await clock.advance(4999)
+  expect(live.fetches).toBe(before)
+  await clock.advance(1)
+  expect(live.fetches).toBe(before + 1)
+  expect(await pane.find({ type: 'Text', text: /Jsi tam\?/ })).toBeDefined()
+})
+
+test('after 5 minutes without activity the conversation goes back to the list and stops polling', async ($, on) => {
+  const live = liveConversation(on, [said(101, 'Ahoj')])
+  const { clock } = engine(on)
+  mock.env(on, {})
+  const pane = await openConversation($)
+
+  await clock.advance(4 * 60_000)
+  expect(await pane.find({ key: 'back' })).toBeDefined()
+  await pane.input({ key: 'reply', text: 'Ja', kind: 'change' }) // typing is activity
+  await clock.advance(4 * 60_000)
+  expect(await pane.find({ key: 'back' })).toBeDefined()
+  live.list = [said(101, 'Ahoj'), said(102, 'Haló?')] // so is a new message
+  await clock.advance(4 * 60_000)
+  expect(await pane.find({ key: 'back' })).toBeDefined()
+
+  await clock.advance(60_000 + 5_000)
+  expect(await pane.find({ key: 'back' })).toBeUndefined()
+  expect(await pane.find({ key: 'c-10' })).toBeDefined()
+  const after = live.fetches
+  await clock.advance(60_000)
+  expect(live.fetches).toBe(after)
+})
