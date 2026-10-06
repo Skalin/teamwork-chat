@@ -1103,7 +1103,7 @@ export const register: Register = (on, options) => {
     // Tabs and actions as framed badges of three Buttons (top edge, label, bottom edge) sharing one
     // action, so the whole badge is clickable; hovering it inverts all three rows as one block. The
     // active tab gets a heavy frame and full-strength text; the rest a thin, dim one.
-    const chip = (key: string, label: string, onPress: () => void, isActive = false, hotkey?: string) => {
+    const chip = (key: string, label: string, onPress: () => void, isActive = false, action?: string) => {
       const inner = ` ${label} `
       if (isActive) {
         // The active tab is no Button (pressing it would do nothing), so it can take colours:
@@ -1118,13 +1118,12 @@ export const register: Register = (on, options) => {
       // The surface inverts the Button row under the pointer and no Button can opt out, so every
       // row inverts in orange on hover: the whole badge becomes one solid orange block.
       const invert = { color: ORANGE, inverse: true, dimColor: false } as const
-      // a hotkey draws as "v: " before the middle row, so the top and bottom rows step in as far
-      const indent = hotkey ? <Text>{' '.repeat(columnsOf(`${hotkey}: `))}</Text> : null
+      // an engine action (a chord the person bound) presses the badge too, and draws no mark
       return (
         <Box key={`chip-${key}`} flexDirection="column">
-          <Box flexDirection="row">{indent}<Button key={`${key}-top`} plain dimColor hover={invert} label={`╭${edge}╮`} onPress={onPress} /></Box>
-          <Button key={key} plain dimColor hover={invert} hotkey={hotkey} label={`│${inner}│`} onPress={onPress} />
-          <Box flexDirection="row">{indent}<Button key={`${key}-bottom`} plain dimColor hover={invert} label={`╰${edge}╯`} onPress={onPress} /></Box>
+          <Button key={`${key}-top`} plain dimColor hover={invert} label={`╭${edge}╮`} onPress={onPress} />
+          <Button key={key} plain dimColor hover={invert} action={action} label={`│${inner}│`} onPress={onPress} />
+          <Button key={`${key}-bottom`} plain dimColor hover={invert} label={`╰${edge}╯`} onPress={onPress} />
         </Box>
       )
     }
@@ -1314,7 +1313,7 @@ export const register: Register = (on, options) => {
                 await discardPasted($)
                 const grabbed = await grabClipboardImage($)
                 await update($, pasted, () => grabbed)
-              }), false, 'v')}
+              }), false, 'chat:imagePaste')}
             </Box>
           )}
           <Box marginTop={1} flexDirection="row" gap={1}>

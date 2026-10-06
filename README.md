@@ -42,6 +42,20 @@ In **kitty** or **Ghostty** images are drawn with real pixels (the kitty graphic
 
 The `pictures` option (in `/config`, or `pluginConfigs` in settings) overrides the choice: `auto` (default), `image` (e.g. WezTerm with `enable_kitty_graphics = true`), `mosaic` or `off`.
 
+### Pasting images with Ctrl+V
+
+The 📋 Paste image badge answers Claude Code's own image-paste action (`chat:imagePaste`). By default that action is bound only in Claude's prompt; to paste into the chat pane with Ctrl+V or Alt+V, add the pane contexts to your `keybindings.json` (`~/.claude/keybindings.json`, or the one in your `CLAUDE_CONFIG_DIR`):
+
+```json
+{
+  "$schema": "https://www.schemastore.org/claude-code-keybindings.json",
+  "bindings": [
+    { "context": "Pane", "bindings": { "ctrl+v": "chat:imagePaste", "alt+v": "chat:imagePaste" } },
+    { "context": "PaneField", "bindings": { "ctrl+v": "chat:imagePaste", "alt+v": "chat:imagePaste" } }
+  ]
+}
+```
+
 ### Permissions in auto mode
 
 In auto mode, give the mod's Teamwork calls an allow rule in your `settings.json`, or the classifier may refuse them:
