@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { TwConversation, TwFile, TwMessage, TwPastedImage, TwPerson, TwPicture, TwView } from '../types'
+import type { TwConversation, TwFile, TwMessage, TwPastedImage, TwPerson, TwPicture, TwProgress, TwView } from '../types'
 
 export type Platform = 'wsl' | 'windows' | 'unix'
 export type PictureMode = 'image' | 'mosaic' | 'off'
@@ -26,7 +26,7 @@ const isBusy = atom({ plugin: 'teamwork-chat', key: 'isBusy' } as const, false)
 const siteUrl = atom({ plugin: 'teamwork-chat', key: 'siteUrl' } as const, null)
 const pictures = atom({ plugin: 'teamwork-chat', key: 'pictures' } as const, {})
 const suggestion = atom({ plugin: 'teamwork-chat', key: 'suggestion' } as const, null)
-const isSuggesting = atom({ plugin: 'teamwork-chat', key: 'isSuggesting' } as const, false)
+const drafting = atom({ plugin: 'teamwork-chat', key: 'drafting' } as const, null)
 const replyGeneration = atom({ plugin: 'teamwork-chat', key: 'replyGeneration' } as const, 0)
 const hasReplyText = atom({ plugin: 'teamwork-chat', key: 'hasReplyText' } as const, false)
 const pasted = atom({ plugin: 'teamwork-chat', key: 'pasted' } as const, null)
@@ -45,6 +45,14 @@ type Json = any
 
 async function tw($: $, tool: string, args: Record<string, unknown> = {}): Promise<Json> {
   const result = await $.mcp.call(SERVER, `twchat-${tool}`, args)
+  const text = result.content.map(block => block.text ?? '').join('')
+  if (result.isError) throw new Error(text || `${tool} failed`)
+  return text ? JSON.parse(text) : {}
+}
+
+// The same for a Teamwork Projects tool.
+async function twp($: $, tool: string, args: Record<string, unknown> = {}): Promise<Json> {
+  const result = await $.mcp.call(SERVER, `twprojects-${tool}`, args)
   const text = result.content.map(block => block.text ?? '').join('')
   if (result.isError) throw new Error(text || `${tool} failed`)
   return text ? JSON.parse(text) : {}
@@ -835,62 +843,107 @@ export function sweep(frame: number, width = SEND_BAR.width, lit = SEND_BAR.lit)
   return { before: at, lit: Math.min(lit, width), after: Math.max(0, width - lit - at) }
 }
 
-// Sends the pasted image with a moving bar, the step it is on and the seconds so far, in place of its buttons.
-async function sendPasted($: $, convId: number, image: TwPastedImage): Promise<void> {
+type SetProgress = (fn: (p: TwProgress | null) => TwProgress | null) => Promise<unknown>
+
+// Runs work under a moving bar: the step it is on and the seconds so far, written through set while it runs.
+async function withProgress(
+  $: $,
+  set: SetProgress,
+  firstStep: string,
+  work: (onStep: (step: string) => Promise<void>) => Promise<void>,
+): Promise<void> {
   const startedAt = await $.clock.now()
   let frame = 0
-  await update($, sending, () => ({ step: 'Uploading the image', frame, seconds: 0 }))
+  await set(() => ({ step: firstStep, frame, seconds: 0 }))
   const timer = $.clock.every(SEND_FRAME_MS, () => void (async () => {
     frame += 1
     const seconds = Math.floor(((await $.clock.now()) - startedAt) / 1000)
-    await update($, sending, s => (s ? { ...s, frame, seconds } : s))
+    await set(s => (s ? { ...s, frame, seconds } : s))
   })())
-  const onStep = async (step: string) => {
-    await update($, sending, s => (s ? { ...s, step } : s))
-  }
   try {
-    await busy($, async () => {
-      await sendImage($, convId, image, onStep)
-      await onStep('Loading the conversation')
-      await discardPasted($)
-      await loadMessages($, convId)
-    })
+    await work(async step => void (await set(s => (s ? { ...s, step } : s))))
   } finally {
     timer.cancel()
-    await update($, sending, () => null)
+    await set(() => null)
   }
+}
+
+// Sends the pasted image with a moving bar, the step it is on and the seconds so far, in place of its buttons.
+async function sendPasted($: $, convId: number, image: TwPastedImage): Promise<void> {
+  await withProgress($, fn => update($, sending, fn), 'Uploading the image', onStep => busy($, async () => {
+    await sendImage($, convId, image, onStep)
+    await onStep('Loading the conversation')
+    await discardPasted($)
+    await loadMessages($, convId)
+  }))
 }
 
 function sizeLabel(bytes: number): string {
   return bytes >= 1_048_576 ? `${(bytes / 1_048_576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`
 }
 
-// Drafts a reply from the last messages of the open conversation and puts it into the field.
+const SUGGEST_MESSAGES = 50 // newest messages of the conversation a suggestion reads
+const ACTIVITY_DAYS = 3 // and how far back it reads the person's own Teamwork activity
+const ACTIVITY_LINES = 30
+
+// The person's own recent Teamwork Projects activity as lines, newest first; empty when none or unreachable.
+async function myActivity($: $, myId: number): Promise<string[]> {
+  const since = new Date((await $.clock.now()) - ACTIVITY_DAYS * 86_400_000).toISOString()
+  const r = await twp($, 'list_activities', {
+    user_ids: [myId], start_date: since, order_by: 'date', order_mode: 'desc', page_size: 100,
+    fields: ['dateTime', 'activityType', 'description', 'extraDescription'],
+  }).catch(() => ({}))
+  const lines: string[] = []
+  for (const a of (r.activities ?? []) as Json[]) {
+    const what = oneLine(String(a.description ?? ''), 120)
+    if (!what) continue
+    const within = a.extraDescription ? ` (${oneLine(String(a.extraDescription), 80)})` : ''
+    const line = `${clock(a.dateTime ?? '')} ${a.activityType ?? 'updated'}: ${what}${within}`
+    // a bulk edit lists the same item many times; once is enough
+    if (!lines.some(l => l.endsWith(`: ${what}${within}`))) lines.push(line)
+    if (lines.length >= ACTIVITY_LINES) break
+  }
+  return lines
+}
+
+// Drafts a reply from the conversation's newest messages and the person's own recent Teamwork activity,
+// under a moving bar, and puts it into the field.
 async function suggestReply($: $, convId: number, title: string): Promise<void> {
   const myId = await read($, me)
   const myName = (myId !== null && names.get(myId)) || 'me'
-  const recent = (await read($, messages)).slice(-20)
-  if (recent.length === 0) throw new Error('There are no messages to reply to yet.')
-  const transcript = recent
-    .map(m => `${m.authorId === myId ? `${myName} (me)` : m.author}: ${m.body || (m.file ? `[file: ${m.file.name}]` : '')}`)
-    .join('\n')
-  await update($, isSuggesting, () => true)
-  try {
-    const r = await $.model.complete({
+  await withProgress($, fn => update($, drafting, fn), 'Reading the conversation', async onStep => {
+    const r = await tw($, 'list_messages', { conversation_id: convId, page_size: SUGGEST_MESSAGES })
+    const fetched = ((r.messages ?? []) as Json[]).reverse()
+    const recent = fetched.length > 0
+      ? fetched.map(m => ({ authorId: m.author?.id ?? 0, author: m.author?.fullName ?? '?', body: m.body ?? '', file: m.file ? { name: m.file.name ?? 'file' } : null, createdAt: m.createdAt ?? '' }))
+      : (await read($, messages)).map(m => ({ ...m, file: m.file ? { name: m.file.name } : null }))
+    if (recent.length === 0) throw new Error('There are no messages to reply to yet.')
+    const transcript = recent
+      .map(m => `[${clock(m.createdAt)}] ${m.authorId === myId ? `${myName} (me)` : m.author}: ${m.body || (m.file ? `[file: ${m.file.name}]` : '')}`)
+      .join('\n')
+
+    await onStep('Reading your Teamwork activity')
+    const activity = myId !== null ? await myActivity($, myId) : []
+
+    await onStep('Writing the reply')
+    const context = activity.length > 0
+      ? `\n\nWhat ${myName} did in Teamwork Projects in the last ${ACTIVITY_DAYS} days, newest first:\n\n${activity.join('\n')}`
+      : ''
+    const r2 = await $.model.complete({
       model: 'sonnet',
       maxTokens: 400,
       system:
         `You draft the next chat message for ${myName} in a Teamwork Chat conversation ("${title}"). ` +
         'Write in the language and tone the conversation uses, briefly, as a colleague would. ' +
+        `When ${myName}'s recent Teamwork activity answers what was asked (a task done, a status, what they work on), ` +
+        'use it concretely; leave it out when it is not relevant, and never invent work that is not listed. ' +
         'Answer with the message text only: no quotes, no name, no explanation.',
-      prompt: `The conversation so far, oldest first:\n\n${transcript}\n\nWrite ${myName}'s next message.`,
+      prompt: `The conversation so far, oldest first:\n\n${transcript}${context}\n\nWrite ${myName}'s next message.`,
     })
-    if (!r.isAnswered) throw new Error(`Could not draft a reply (${r.reason}).`)
-    const text = r.text.trim().replace(/^["„“]|["“”]$/g, '')
+    if (!r2.isAnswered) throw new Error(`Could not draft a reply (${r2.reason}).`)
+    const text = r2.text.trim().replace(/^["„“]|["“”]$/g, '')
     await update($, suggestion, () => ({ convId, text }))
-  } finally {
-    await update($, isSuggesting, () => false)
-  }
+  })
 }
 
 async function openFromBadge($: $, c: TwConversation): Promise<void> {
@@ -1128,6 +1181,19 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
+    // A moving bar, the step under way and the seconds so far. No percentage: the waits are
+    // Teamwork's and the model's, so the bar only shows that something is moving.
+    const progressBar = (key: string, p: TwProgress, marginTop = 0) => {
+      const run = sweep(p.frame)
+      return (
+        <Box key={key} flexDirection="row" marginTop={marginTop} marginBottom={1}>
+          <Text dimColor>{'─'.repeat(run.before)}</Text>
+          <Text color="suggestion">{'━'.repeat(run.lit)}</Text>
+          <Text dimColor>{'─'.repeat(run.after)}</Text>
+          <Text dimColor> {p.step}… {p.seconds}s</Text>
+        </Box>
+      )
+    }
     const tabs = (
       <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" marginBottom={1}>
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -1185,7 +1251,7 @@ export const register: Register = (on, options) => {
       const back = () => void leaveConv($)
       const image = await read($, pasted)
       const sendState = await read($, sending)
-      const drafting = await read($, isSuggesting)
+      const draftState = await read($, drafting)
       const suggested = await read($, suggestion)
       const draftText = suggested?.convId === v.convId ? suggested.text : undefined
       // A field keeps what was typed over any value drawn into it, so clearing draws a fresh field.
@@ -1236,10 +1302,11 @@ export const register: Register = (on, options) => {
                 <Text dimColor>{conv ? kindOf(conv) : 'Conversation'}</Text>
               </Box>
             </Box>
-            {chip('suggest', drafting ? '✨ Writing…' : '✨ Suggest reply', () => {
-              if (!drafting) void busy($, () => suggestReply($, v.convId, v.title))
+            {chip('suggest', draftState ? '✨ Writing…' : '✨ Suggest reply', () => {
+              if (!draftState) void busy($, () => suggestReply($, v.convId, v.title))
             })}
           </Box>
+          {draftState && progressBar('suggest-progress', draftState)}
           {msgs.length === 0 && <Text dimColor>{loading ? 'Loading…' : 'No messages.'}</Text>}
           {from > 0 && <Text dimColor>↑ {from} older {from === 1 ? 'message' : 'messages'}</Text>}
           {visible.map(m => {
@@ -1289,18 +1356,7 @@ export const register: Register = (on, options) => {
           {image && (
             <Box key="pasted" marginTop={1} flexDirection="column" borderStyle="round" borderColor="suggestion" paddingX={1}>
               <Text>🖼  {image.width}×{image.height} · {sizeLabel(image.bytes)}</Text>
-              {sendState ? (() => {
-                // no percentage: the whole image leaves at once, the wait is Teamwork's, so the bar only shows it is moving
-                const run = sweep(sendState.frame)
-                return (
-                  <Box key="image-sending" flexDirection="row" marginY={1}>
-                    <Text dimColor>{'─'.repeat(run.before)}</Text>
-                    <Text color="suggestion">{'━'.repeat(run.lit)}</Text>
-                    <Text dimColor>{'─'.repeat(run.after)}</Text>
-                    <Text dimColor> {sendState.step}… {sendState.seconds}s</Text>
-                  </Box>
-                )
-              })() : (
+              {sendState ? progressBar('image-sending', sendState, 1) : (
                 <Box flexDirection="row" gap={1}>
                   {chip('image-send', 'Send', () => void sendPasted($, v.convId, image))}
                   {chip('image-cancel', 'Cancel', () => void touch($).then(() => discardPasted($)))}

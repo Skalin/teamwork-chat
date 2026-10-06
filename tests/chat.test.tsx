@@ -654,3 +654,48 @@ test('the paste badge lights all three rows together, though its middle row carr
   }
   expect((await pane.find({ key: 'paste' }))?.props).toMatchObject({ action: 'chat:imagePaste' })
 })
+
+test('Suggest reply reads my recent Teamwork activity too, under a moving bar with the step it is on', async ($, on) => {
+  const activityArgs: any[] = []
+  on('mcp.call', { tool: 'twprojects-list_activities' }, ($, e) => {
+    activityArgs.push(e.args)
+    const edit = { activityType: 'edited', dateTime: '2026-10-06T13:50:06Z', description: 'Fix login redirect', extraDescription: 'Sprint 12' }
+    // a bulk edit lists the same item more than once
+    return reply({ activities: [edit, edit, { ...edit, activityType: 'completed', description: 'Deploy to staging' }] })
+  })
+  const { clock } = engine(on)
+  const asked: { prompt: string; system?: string }[] = []
+  let answer: (v: unknown) => void = () => {}
+  on('model.complete', ($, e) => {
+    asked.push({ prompt: e.prompt, system: e.system })
+    return new Promise(resolve => {
+      answer = resolve
+    }) as any
+  })
+  const pane = await openConversation($)
+  const pressed = pane.press({ key: 'suggest' })
+  await clock.advance(1_200)
+
+  // while the model writes, the badge says so and the bar names the step
+  expect(await pane.find({ key: 'suggest-progress' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: / Writing the reply… \d+s$/ })).toBeDefined()
+  expect((await pane.find({ key: 'suggest' }))?.text).toContain('✨ Writing…')
+
+  expect(activityArgs[0]).toMatchObject({ user_ids: [ME], order_by: 'date', order_mode: 'desc' })
+  expect(asked[0]!.prompt).toContain('Anna Nová: Ahoj, máš chvilku?')
+  expect(asked[0]!.prompt).toContain('edited: Fix login redirect (Sprint 12)')
+  expect(asked[0]!.prompt.match(/Fix login redirect/g)).toHaveLength(1)
+  expect(asked[0]!.prompt).toContain('completed: Deploy to staging')
+  expect(asked[0]!.system).toContain('never invent')
+
+  answer({
+    value: {
+      isAnswered: true, text: 'Login redirect je opravený, teď nasazuju na staging.',
+      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    },
+  })
+  await pressed
+  await clock.advance(200)
+  expect(await pane.find({ key: 'suggest-progress' })).toBeUndefined()
+  expect((await pane.find({ type: 'Input', key: 'reply' }))?.text).toBe('Login redirect je opravený, teď nasazuju na staging.')
+})

@@ -46,6 +46,9 @@ export type TwPastedImage = {
   bytes: number
 }
 
+// A long step under way: what it is doing, the moving bar's frame, the seconds so far.
+export type TwProgress = { step: string; frame: number; seconds: number }
+
 export type TwPerson = { id: number; name: string; handle: string }
 
 export type TwView =
@@ -67,11 +70,11 @@ declare module 'claude-code' {
       isBusy: boolean
       isFocus: boolean
       pasted: TwPastedImage | null
-      sending: { step: string; frame: number; seconds: number } | null
+      sending: TwProgress | null
       siteUrl: string | null
       pictures: Record<string, TwPicture>
       suggestion: { convId: number; text: string } | null
-      isSuggesting: boolean
+      drafting: TwProgress | null
       replyGeneration: number
       hasReplyText: boolean
       retryIn: number | null
