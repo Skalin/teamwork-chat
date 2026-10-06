@@ -5,7 +5,7 @@ A Claude Code mod that brings **Teamwork Chat** into your Claude Code session, s
 - 🔔 **Unread at a glance**: a band above the prompt, a status line, a toast when a message arrives, and unread cards at the top of the pane
 - 💬 **Conversations pane**: your recent conversations as cards, with unread counts and message previews (`/tw`, `/tw unread`)
 - ✉️ **Reply and message people**: reply inside a conversation, or start a DM from the pane or with `/tw-dm Name Surname message`
-- ✨ **Suggest reply**: Claude drafts your next message from the conversation, in its language, for you to edit and send
+- ✨ **Suggest reply**: Claude drafts your next message from the conversation's last 50 messages and what you did in Teamwork Projects over the last 3 days, in the conversation's language, for you to edit and send; a moving bar shows the step it is on
 - 🖼 **Images and files**: paste an image from the Windows clipboard and send it; images show as previews, files as badges that open in the browser
 - 🙈 **Focus mode**: hide the Claude conversation so Teamwork takes the screen (`/tw-focus`)
 
