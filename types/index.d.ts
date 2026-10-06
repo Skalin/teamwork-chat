@@ -69,6 +69,7 @@ declare module 'claude-code' {
       suggestion: { convId: number; text: string } | null
       isSuggesting: boolean
       replyGeneration: number
+      hasReplyText: boolean
     }
   }
 }

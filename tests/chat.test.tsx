@@ -300,6 +300,7 @@ test('Suggest reply drafts a message from the conversation into the field', asyn
     }
   })
   const pane = await openConversation($)
+  expect(await pane.find({ key: 'clear' })).toBeUndefined() // nothing written yet
 
   expect(await pane.find({ type: 'Text', text: /\d\d:\d\d$/ })).toBeDefined() // message times stay
   // the frame is as wide as the label row, the two-column ✨ included
@@ -311,10 +312,18 @@ test('Suggest reply drafts a message from the conversation into the field', asyn
   expect(asked[0]!.system).toContain('language')
   expect((await pane.find({ type: 'Input', key: 'reply' }))?.text).toBe('Jasně, mám chvilku. Co potřebuješ?')
 
-  // ✕ beside the field empties it: a fresh, empty field takes its place
+  // ✕ beside the field empties it: a fresh, empty field takes its place, and ✕ hides again
+  expect(await pane.find({ key: 'clear' })).toBeDefined() // shown for the suggestion
   await pane.press({ key: 'clear' })
   expect(await pane.find({ type: 'Input', key: 'reply' })).toBeUndefined()
   expect((await pane.find({ type: 'Input', key: 'reply-1' }))?.text ?? '').toBe('')
+  expect(await pane.find({ key: 'clear' })).toBeUndefined()
+
+  // typing shows it, emptying the field by hand hides it
+  await pane.input({ key: 'reply-1', text: 'a', kind: 'change' })
+  expect(await pane.find({ key: 'clear' })).toBeDefined()
+  await pane.input({ key: 'reply-1', text: '', kind: 'change' })
+  expect(await pane.find({ key: 'clear' })).toBeUndefined()
 })
 
 test('columnsOf counts wide emoji as two columns, so badge frames line up', async () => {

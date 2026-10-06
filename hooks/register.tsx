@@ -21,6 +21,7 @@ const pictures = atom({ plugin: 'teamwork-chat', key: 'pictures' } as const, {})
 const suggestion = atom({ plugin: 'teamwork-chat', key: 'suggestion' } as const, null)
 const isSuggesting = atom({ plugin: 'teamwork-chat', key: 'isSuggesting' } as const, false)
 const replyGeneration = atom({ plugin: 'teamwork-chat', key: 'replyGeneration' } as const, 0)
+const hasReplyText = atom({ plugin: 'teamwork-chat', key: 'hasReplyText' } as const, false)
 const pasted = atom({ plugin: 'teamwork-chat', key: 'pasted' } as const, null)
 const isFocus = atom({ plugin: 'teamwork-chat', key: 'isFocus' } as const, true)
 
@@ -835,6 +836,7 @@ export const register: Register = on => {
       const back = () => void (async () => {
         await discardPasted($)
         await update($, suggestion, () => null)
+        await update($, hasReplyText, () => false)
         await update($, view, (): TwView => ({ mode: 'all' }))
       })()
       const image = await read($, pasted)
@@ -844,8 +846,12 @@ export const register: Register = on => {
       // A field keeps what was typed over any value drawn into it, so clearing draws a fresh field.
       const generation = await read($, replyGeneration)
       const replyKey = generation === 0 ? 'reply' : `reply-${generation}`
+      // ✕ shows only while the field holds something; written when that flips, not per keystroke
+      const isTyped = await read($, hasReplyText)
+      const showClear = isTyped || (draftText ?? '') !== ''
       const clearReply = () => void (async () => {
         await update($, suggestion, () => null)
+        await update($, hasReplyText, () => false)
         const next = await update($, replyGeneration, n => n + 1)
         await $.ui.focus({ requestId: PANE, key: `reply-${next}` }).catch(() => undefined)
       })()
@@ -951,8 +957,12 @@ export const register: Register = on => {
           <Box marginTop={1} flexDirection="row" gap={1}>
             <Box flexGrow={1}>
             <Input key={replyKey} placeholder="Write a message…" submitLabel="send" autoFocus value={draftText}
+              onInput={(text: string) => {
+                if ((text !== '') !== isTyped) void update($, hasReplyText, () => text !== '')
+              }}
               onSubmit={(text: string) => {
                 void update($, suggestion, () => null)
+                void update($, hasReplyText, () => false)
                 if (!text.trim()) return
                 void busy($, async () => {
                   await tw($, 'send_message', { conversation_id: v.convId, body: text })
@@ -961,7 +971,7 @@ export const register: Register = on => {
                 })
               }} />
             </Box>
-            <Button key="clear" plain label="✕" onPress={clearReply} />
+            {showClear && <Button key="clear" plain label="✕" onPress={clearReply} />}
           </Box>
         </Box>
       )
