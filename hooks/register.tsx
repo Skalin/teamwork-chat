@@ -227,7 +227,6 @@ async function loadMe($: $): Promise<void> {
   const user = await tw($, 'get_current_user')
   await update($, me, () => user.account?.user?.id ?? user.account?.id ?? user.user?.id ?? null)
   await update($, siteUrl, () => siteOf(user))
-  await loadPeople($)
 }
 
 // Refreshes, then schedules the next refresh: soon, with a countdown, while the connector is not up yet.
@@ -251,6 +250,9 @@ async function refresh($: $, { isQuiet = false } = {}): Promise<void> {
   try {
     // tried again on every refresh until it works: at startup the connector may not be up yet
     if ((await read($, me)) === null) await loadMe($)
+    // names live in this module, me in the session's state: a plugin reload keeps me and empties
+    // names, so they are loaded on their own until they arrive, or every DM would be titled #id
+    if (names.size === 0) await loadPeople($)
     const myId = await read($, me)
     const before = new Map((await read($, convs)).map(c => [c.id, c.latestId]))
     const fresh: TwConversation[] = []
@@ -1298,12 +1300,12 @@ export const register: Register = (on, options) => {
             <Box flexDirection="row" flexGrow={1}>
               <Text color="warning">{'▌\n▌'}</Text>
               <Box flexDirection="column" marginLeft={1}>
-                <Text bold>{conv ? iconOf(conv) : '💬'} {oneLine(v.title, Math.max(8, width - 40))}</Text>
+                <Text bold>{conv ? iconOf(conv) : '💬'} {oneLine(conv?.title ?? v.title, Math.max(8, width - 40))}</Text>
                 <Text dimColor>{conv ? kindOf(conv) : 'Conversation'}</Text>
               </Box>
             </Box>
             {chip('suggest', draftState ? '✨ Writing…' : '✨ Suggest reply', () => {
-              if (!draftState) void busy($, () => suggestReply($, v.convId, v.title))
+              if (!draftState) void busy($, () => suggestReply($, v.convId, conv?.title ?? v.title))
             })}
           </Box>
           {draftState && progressBar('suggest-progress', draftState)}
