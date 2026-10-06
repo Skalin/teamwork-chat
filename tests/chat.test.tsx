@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { cellsFromChafa, columnsOf, errorLine, pictureModeFrom, pictureSize, platformFrom, rasterFrom, splitLinks } from '../hooks/register.tsx'
+import { cellsFromChafa, columnsOf, sweep, errorLine, pictureModeFrom, pictureSize, platformFrom, rasterFrom, splitLinks } from '../hooks/register.tsx'
 
 const ME = 1
 const ANNA = 2
@@ -581,4 +581,44 @@ test('after 5 minutes without activity the conversation goes back to the list an
   const after = live.fetches
   await clock.advance(60_000)
   expect(live.fetches).toBe(after)
+})
+
+test('sweep moves the lit run right, then back, and never off the track', async () => {
+  expect(sweep(0, 10, 4)).toEqual({ before: 0, lit: 4, after: 6 })
+  expect(sweep(6, 10, 4)).toEqual({ before: 6, lit: 4, after: 0 })
+  expect(sweep(7, 10, 4)).toEqual({ before: 5, lit: 4, after: 1 })
+  expect(sweep(12, 10, 4)).toEqual({ before: 0, lit: 4, after: 6 })
+})
+
+test('while an image is sent a moving bar shows the step and the seconds in place of its buttons', async ($, on) => {
+  const { clock } = engine(on)
+  mock.env(on, { TEAMWORK_API_KEY: 'key123', WSL_DISTRO_NAME: 'Ubuntu' })
+  on('process.run', async ($, e) => {
+    if (e.argv[0] === 'powershell.exe') return done('C:\\Temp\\tw-paste-1.png|1280|720|250000\r\n')
+    if (e.argv[0] === 'wslpath') return done('/mnt/c/Temp/tw-paste-1.png\n')
+    if (e.argv[0] === 'curl') {
+      await clock.sleep(3_000) // a slow upload, answered on the test's clock
+      return done('{"tempId":"chat-attachment-abc"}')
+    }
+    return done()
+  })
+  on('http.fetch', () => ({ value: { status: 201, ok: true, headers: {}, text: '{}' } }))
+  const pane = await openConversation($)
+
+  // the paste and send controls are framed badges like the tabs
+  expect((await pane.find({ key: 'paste-top' }))?.text).toBe(`╭${'─'.repeat(columnsOf(' 📋 Paste image '))}╮`)
+  await pane.press({ key: 'paste' })
+  expect((await pane.find({ key: 'image-send' }))?.text).toBe('│ Send │')
+  await pane.press({ key: 'image-send' })
+
+  await clock.advance(1_200)
+  expect(await pane.find({ key: 'image-sending' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: 'Uploading the image… 1s' })).toBeDefined()
+  expect(await pane.find({ key: 'image-send' })).toBeUndefined()
+  expect(await pane.find({ key: 'paste' })).toBeUndefined()
+
+  await clock.advance(2_000)
+  expect(await pane.find({ key: 'image-sending' })).toBeUndefined()
+  expect(await pane.find({ key: 'pasted' })).toBeUndefined()
+  expect(await pane.find({ key: 'paste' })).toBeDefined()
 })

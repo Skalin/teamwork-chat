@@ -30,6 +30,7 @@ const isSuggesting = atom({ plugin: 'teamwork-chat', key: 'isSuggesting' } as co
 const replyGeneration = atom({ plugin: 'teamwork-chat', key: 'replyGeneration' } as const, 0)
 const hasReplyText = atom({ plugin: 'teamwork-chat', key: 'hasReplyText' } as const, false)
 const pasted = atom({ plugin: 'teamwork-chat', key: 'pasted' } as const, null)
+const sending = atom({ plugin: 'teamwork-chat', key: 'sending' } as const, null)
 const isFocus = atom({ plugin: 'teamwork-chat', key: 'isFocus' } as const, true)
 const retryIn = atom({ plugin: 'teamwork-chat', key: 'retryIn' } as const, null)
 
@@ -763,12 +764,13 @@ async function apiKey($: $): Promise<string | undefined> {
 }
 
 // The web app's own two steps: upload the file (no login), then post a message carrying its tempId.
-async function sendImage($: $, convId: number, image: TwPastedImage, caption = ''): Promise<void> {
+async function sendImage($: $, convId: number, image: TwPastedImage, onStep: (step: string) => Promise<void>, caption = ''): Promise<void> {
   const key = await apiKey($)
   if (!key) {
     throw new Error(`Put your Teamwork API key in ${await keyFile($)} as TEAMWORK_API_KEY=… (or set it in the environment).`)
   }
 
+  await onStep('Uploading the image')
   const up = await $.process.run(
     [await curl($), '-sS', '--fail-with-body', '--max-time', '60', '-F', `file=@${image.path};type=image/png`, UPLOAD_URL],
     { timeoutMs: 70_000 },
@@ -790,6 +792,7 @@ async function sendImage($: $, convId: number, image: TwPastedImage, caption = '
   if (!site) throw new Error('Could not find your Teamwork site address (get_current_user gave no account.url).')
   const url = `${site.replace(/\/$/, '')}/chat/v7/conversations/${convId}/messages`
   const body = JSON.stringify({ message: { body: caption, file: { tempId } } })
+  await onStep('Posting it to the conversation')
   for (const authorization of authHeaders(key)) {
     const sent = await $.http.fetch(url, {
       method: 'POST',
@@ -820,6 +823,42 @@ async function openInBrowser($: $, url: string): Promise<void> {
     if (ran?.exitCode === 0) return
   }
   throw new Error(`Could not open a browser. The link: ${url}`)
+}
+
+const SEND_FRAME_MS = 120
+const SEND_BAR = { width: 24, lit: 6 }
+
+// The lit run of the sending bar for one frame: it sweeps right, then back, never off the track.
+export function sweep(frame: number, width = SEND_BAR.width, lit = SEND_BAR.lit): { before: number; lit: number; after: number } {
+  const span = width - lit
+  const at = span <= 0 ? 0 : frame % (span * 2) <= span ? frame % (span * 2) : span * 2 - (frame % (span * 2))
+  return { before: at, lit: Math.min(lit, width), after: Math.max(0, width - lit - at) }
+}
+
+// Sends the pasted image with a moving bar, the step it is on and the seconds so far, in place of its buttons.
+async function sendPasted($: $, convId: number, image: TwPastedImage): Promise<void> {
+  const startedAt = await $.clock.now()
+  let frame = 0
+  await update($, sending, () => ({ step: 'Uploading the image', frame, seconds: 0 }))
+  const timer = $.clock.every(SEND_FRAME_MS, () => void (async () => {
+    frame += 1
+    const seconds = Math.floor(((await $.clock.now()) - startedAt) / 1000)
+    await update($, sending, s => (s ? { ...s, frame, seconds } : s))
+  })())
+  const onStep = async (step: string) => {
+    await update($, sending, s => (s ? { ...s, step } : s))
+  }
+  try {
+    await busy($, async () => {
+      await sendImage($, convId, image, onStep)
+      await onStep('Loading the conversation')
+      await discardPasted($)
+      await loadMessages($, convId)
+    })
+  } finally {
+    timer.cancel()
+    await update($, sending, () => null)
+  }
 }
 
 function sizeLabel(bytes: number): string {
@@ -1064,7 +1103,7 @@ export const register: Register = (on, options) => {
     // Tabs and actions as framed badges of three Buttons (top edge, label, bottom edge) sharing one
     // action, so the whole badge is clickable; hovering it inverts all three rows as one block. The
     // active tab gets a heavy frame and full-strength text; the rest a thin, dim one.
-    const chip = (key: string, label: string, onPress: () => void, isActive = false) => {
+    const chip = (key: string, label: string, onPress: () => void, isActive = false, hotkey?: string) => {
       const inner = ` ${label} `
       if (isActive) {
         // The active tab is no Button (pressing it would do nothing), so it can take colours:
@@ -1079,11 +1118,13 @@ export const register: Register = (on, options) => {
       // The surface inverts the Button row under the pointer and no Button can opt out, so every
       // row inverts in orange on hover: the whole badge becomes one solid orange block.
       const invert = { color: ORANGE, inverse: true, dimColor: false } as const
+      // a hotkey draws as "v: " before the middle row, so the top and bottom rows step in as far
+      const indent = hotkey ? <Text>{' '.repeat(columnsOf(`${hotkey}: `))}</Text> : null
       return (
         <Box key={`chip-${key}`} flexDirection="column">
-          <Button key={`${key}-top`} plain dimColor hover={invert} label={`╭${edge}╮`} onPress={onPress} />
-          <Button key={key} plain dimColor hover={invert} label={`│${inner}│`} onPress={onPress} />
-          <Button key={`${key}-bottom`} plain dimColor hover={invert} label={`╰${edge}╯`} onPress={onPress} />
+          <Box flexDirection="row">{indent}<Button key={`${key}-top`} plain dimColor hover={invert} label={`╭${edge}╮`} onPress={onPress} /></Box>
+          <Button key={key} plain dimColor hover={invert} hotkey={hotkey} label={`│${inner}│`} onPress={onPress} />
+          <Box flexDirection="row">{indent}<Button key={`${key}-bottom`} plain dimColor hover={invert} label={`╰${edge}╯`} onPress={onPress} /></Box>
         </Box>
       )
     }
@@ -1143,6 +1184,7 @@ export const register: Register = (on, options) => {
       // Show the newest messages that fit, so the header and the reply row stay on screen.
       const back = () => void leaveConv($)
       const image = await read($, pasted)
+      const sendState = await read($, sending)
       const drafting = await read($, isSuggesting)
       const suggested = await read($, suggestion)
       const draftText = suggested?.convId === v.convId ? suggested.text : undefined
@@ -1245,25 +1287,36 @@ export const register: Register = (on, options) => {
             )
           })}
           {image && (
-            <Box key="pasted" marginTop={1} flexDirection="row" gap={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
+            <Box key="pasted" marginTop={1} flexDirection="column" borderStyle="round" borderColor="suggestion" paddingX={1}>
               <Text>🖼  {image.width}×{image.height} · {sizeLabel(image.bytes)}</Text>
-              <Button key="image-send" label="Send" variant="primary"
-                onPress={() => void busy($, async () => {
-                  await sendImage($, v.convId, image)
-                  await discardPasted($)
-                  await loadMessages($, v.convId)
-                })} />
-              <Button key="image-cancel" label="Cancel" onPress={() => void touch($).then(() => discardPasted($))} />
+              {sendState ? (() => {
+                // no percentage: the whole image leaves at once, the wait is Teamwork's, so the bar only shows it is moving
+                const run = sweep(sendState.frame)
+                return (
+                  <Box key="image-sending" flexDirection="row" marginY={1}>
+                    <Text dimColor>{'─'.repeat(run.before)}</Text>
+                    <Text color="suggestion">{'━'.repeat(run.lit)}</Text>
+                    <Text dimColor>{'─'.repeat(run.after)}</Text>
+                    <Text dimColor> {sendState.step}… {sendState.seconds}s</Text>
+                  </Box>
+                )
+              })() : (
+                <Box flexDirection="row" gap={1}>
+                  {chip('image-send', 'Send', () => void sendPasted($, v.convId, image))}
+                  {chip('image-cancel', 'Cancel', () => void touch($).then(() => discardPasted($)))}
+                </Box>
+              )}
             </Box>
           )}
-          <Box marginTop={1}>
-            <Button key="paste" label="📋 Paste image" hotkey="v"
-              onPress={() => void busy($, async () => {
+          {!sendState && (
+            <Box marginTop={1}>
+              {chip('paste', '📋 Paste image', () => void busy($, async () => {
                 await discardPasted($)
                 const grabbed = await grabClipboardImage($)
                 await update($, pasted, () => grabbed)
-              })} />
-          </Box>
+              }), false, 'v')}
+            </Box>
+          )}
           <Box marginTop={1} flexDirection="row" gap={1}>
             <Box flexGrow={1}>
             <Input key={replyKey} placeholder="Write a message…" submitLabel="send" autoFocus value={draftText}
