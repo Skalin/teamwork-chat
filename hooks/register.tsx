@@ -20,6 +20,7 @@ const siteUrl = atom({ plugin: 'teamwork-chat', key: 'siteUrl' } as const, null)
 const pictures = atom({ plugin: 'teamwork-chat', key: 'pictures' } as const, {})
 const suggestion = atom({ plugin: 'teamwork-chat', key: 'suggestion' } as const, null)
 const isSuggesting = atom({ plugin: 'teamwork-chat', key: 'isSuggesting' } as const, false)
+const replyGeneration = atom({ plugin: 'teamwork-chat', key: 'replyGeneration' } as const, 0)
 const pasted = atom({ plugin: 'teamwork-chat', key: 'pasted' } as const, null)
 const isFocus = atom({ plugin: 'teamwork-chat', key: 'isFocus' } as const, true)
 
@@ -840,6 +841,14 @@ export const register: Register = on => {
       const drafting = await read($, isSuggesting)
       const suggested = await read($, suggestion)
       const draftText = suggested?.convId === v.convId ? suggested.text : undefined
+      // A field keeps what was typed over any value drawn into it, so clearing draws a fresh field.
+      const generation = await read($, replyGeneration)
+      const replyKey = generation === 0 ? 'reply' : `reply-${generation}`
+      const clearReply = () => void (async () => {
+        await update($, suggestion, () => null)
+        const next = await update($, replyGeneration, n => n + 1)
+        await $.ui.focus({ requestId: PANE, key: `reply-${next}` }).catch(() => undefined)
+      })()
       const drawn = await read($, pictures)
       const site = await read($, siteUrl)
       const linkOf = (f: TwFile) => {
@@ -939,8 +948,9 @@ export const register: Register = on => {
                 await update($, pasted, () => grabbed)
               })} />
           </Box>
-          <Box marginTop={1}>
-            <Input key="reply" placeholder="Write a message…" submitLabel="send" autoFocus value={draftText}
+          <Box marginTop={1} flexDirection="row" gap={1}>
+            <Box flexGrow={1}>
+            <Input key={replyKey} placeholder="Write a message…" submitLabel="send" autoFocus value={draftText}
               onSubmit={(text: string) => {
                 void update($, suggestion, () => null)
                 if (!text.trim()) return
@@ -950,6 +960,8 @@ export const register: Register = on => {
                   await refresh($, { isQuiet: true })
                 })
               }} />
+            </Box>
+            <Button key="clear" plain label="✕" onPress={clearReply} />
           </Box>
         </Box>
       )

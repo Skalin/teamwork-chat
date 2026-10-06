@@ -68,6 +68,7 @@ declare module 'claude-code' {
       pictures: Record<string, TwPicture>
       suggestion: { convId: number; text: string } | null
       isSuggesting: boolean
+      replyGeneration: number
     }
   }
 }

@@ -310,6 +310,11 @@ test('Suggest reply drafts a message from the conversation into the field', asyn
   expect(asked[0]!.prompt).toContain('Anna Nová: Ahoj, máš chvilku?')
   expect(asked[0]!.system).toContain('language')
   expect((await pane.find({ type: 'Input', key: 'reply' }))?.text).toBe('Jasně, mám chvilku. Co potřebuješ?')
+
+  // ✕ beside the field empties it: a fresh, empty field takes its place
+  await pane.press({ key: 'clear' })
+  expect(await pane.find({ type: 'Input', key: 'reply' })).toBeUndefined()
+  expect((await pane.find({ type: 'Input', key: 'reply-1' }))?.text ?? '').toBe('')
 })
 
 test('columnsOf counts wide emoji as two columns, so badge frames line up', async () => {
