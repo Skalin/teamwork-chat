@@ -699,3 +699,24 @@ test('Suggest reply reads my recent Teamwork activity too, under a moving bar wi
   expect(await pane.find({ key: 'suggest-progress' })).toBeUndefined()
   expect((await pane.find({ type: 'Input', key: 'reply' }))?.text).toBe('Login redirect je opravený, teď nasazuju na staging.')
 })
+
+test('when the people list was not there at first, DMs get their names on the next refresh instead of #id', async ($, on) => {
+  // me is known but names are not: what a plugin reload leaves, with the session's state kept
+  let isPeopleUp = false
+  on('mcp.call', { tool: 'twchat-list_people' }, ($, e, next) => {
+    if (!isPeopleUp) return { value: { content: [{ type: 'text', text: 'not yet' }], isError: true } }
+    return next(e)
+  })
+  const { clock } = engine(on)
+  mock.env(on, {})
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'tw', args: '' })
+  isPeopleUp = true
+  await clock.advance(31_000)
+  const pane = await $.ui.mount({
+    plugin: 'teamwork-chat', surface: 'terminal', component: 'Pane', requestId: 'teamwork-chat',
+    props: { title: 'Teamwork Chat', isFocused: true, bodyColumns: 80, placement: 'dock' } as any,
+  })
+  expect((await pane.find({ key: 'c-10' }))?.text).toContain('Anna Nová')
+  expect((await pane.find({ key: 'c-10' }))?.text).not.toContain('#2')
+})
