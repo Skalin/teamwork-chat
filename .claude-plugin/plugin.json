@@ -1,6 +1,6 @@
 {
   "name": "teamwork-chat",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Teamwork Chat inside Claude Code: unread badges, a conversations pane, replies, direct messages, images and suggested replies",
   "author": {
     "name": "Dominik Skála"
