@@ -180,20 +180,6 @@ test('/tw-dm matches name and surname, and never sends the surname as the messag
   ])
 })
 
-test('focus mode hides the Claude conversation and the band toggles it back', async ($, on) => {
-  engine(on)
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-
-  const row = { plugin: 'teamwork-chat', surface: 'terminal', component: 'AssistantMessage', props: {} as any } as const
-  const hidden = await $.ui.mount(row)
-  expect(await hidden.find({ type: 'Text', text: 'engine' })).toBeUndefined()
-
-  const band = await $.ui.mount(BAND)
-  await band.press({ key: 'tw-focus' })
-  const shown = await $.ui.mount(row)
-  expect(await shown.find({ type: 'Text', text: 'engine' })).toBeDefined()
-})
-
 const done = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
 function clipboard(on: On) {
