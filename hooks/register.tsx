@@ -1056,11 +1056,13 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
+    // Other mods' bands stack underneath instead of being replaced.
+    const drawn = await Promise.resolve(next(e)).catch(() => null)
+    const below = drawn && typeof drawn === 'object' && (drawn as { type?: string }).type !== 'engine' ? drawn : null
     const list = await read($, convs)
     const seenMap = await read($, seen)
     const myId = await read($, me)
     const err = errorLine(await read($, error), await read($, retryIn))
-    const focus = await read($, isFocus)
     const unread = list.filter(c => isUnread(c, seenMap, myId))
 
     // A launcher session in the fullscreen layout seats the pane once, wide, beside the transcript.
@@ -1074,13 +1076,6 @@ export const register: Register = (on, options) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const width = e.props.bodyColumns
     const isNarrow = width < 45
-    const toggle = (
-      <Button key="tw-focus" label={focus ? 'Show Claude' : 'Hide Claude'} hotkey="c" dimColor
-        onPress={() => void (async () => {
-          const now = await update($, isFocus, value => !value)
-          await $.store.set('isFocus', now)
-        })()} />
-    )
     const open = (
       <Button key="tw-open" label="Open" hotkey="t"
         onPress={() => void showPane($, unread.length > 0 ? { mode: 'unread' } : { mode: 'all' })} />
@@ -1088,12 +1083,14 @@ export const register: Register = (on, options) => {
 
     if (isNarrow) {
       return (
-        <Box>
-          <Text color={unread.length > 0 ? 'warning' : undefined} bold>
-            💬 {err ? '!' : unread.length === 0 ? '0' : countLabel(unread.reduce((sum, c) => sum + c.unreadCount, 0))}{' '}
-          </Text>
-          {open}
-          {toggle}
+        <Box flexDirection="column">
+          <Box>
+            <Text color={unread.length > 0 ? 'warning' : undefined} bold>
+              💬 {err ? '!' : unread.length === 0 ? '0' : countLabel(unread.reduce((sum, c) => sum + c.unreadCount, 0))}{' '}
+            </Text>
+            {open}
+          </Box>
+          {below}
         </Box>
       )
     }
@@ -1127,11 +1124,13 @@ export const register: Register = (on, options) => {
       )
     }
     return (
-      <Box>
-        <Text bold>💬 Teamwork · </Text>
-        {state}
-        {open}
-        {toggle}
+      <Box flexDirection="column">
+        <Box>
+          <Text bold>💬 Teamwork · </Text>
+          {state}
+          {open}
+        </Box>
+        {below}
       </Box>
     )
   })
